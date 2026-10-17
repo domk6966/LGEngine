@@ -61,7 +61,7 @@ namespace LGEngine
         // this much of what is behind is darkened, fading out over OutlineWidth points.
         internal static float OutlineAlpha = 0.4f, OutlineWidth = 0.8f;
         internal static float ShadowSpread = 12f, ShadowDrop = 5f, ShadowDepth = 0.40f;
-        internal static float RimCreep = 0.12f;        // how fast the view still moves on where the bend would otherwise fold it back (1 = as fast as on the face)
+        internal static float RimCreep = 1f;           // how fast the view still moves on where the bend would otherwise fold it back (1 = as fast as on the face; 0.12 stretched text behind the rim into vertical bars)
         internal static float Thickness = 1.6f;        // glass under the bezel, as a share of its width: more bends the view further
         internal static float Dispersion = 0.07f;      // how far apart red and blue are bent, at full refraction
         internal static float SplitMost = 0.75f;       // ...but never more than this many points either way

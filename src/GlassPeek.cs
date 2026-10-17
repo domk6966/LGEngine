@@ -157,9 +157,30 @@ namespace LGEngine
             wake();
         }
 
+        // A test seam (the bench, nothing else): while TestScreen is set (a picture of the whole screen, 0xRRGGBB, TestW x TestH), Step
+        // takes the backdrop from it instead of the screen: once, and again when the card is somewhere else, the map is another or
+        // TestVersion has moved. No tap, no screen reads.
+        internal static int[] TestScreen;
+        internal static Point TestShift;
+        internal static int TestW, TestH, TestVersion;
+        Point testAt;
+        int testDone = -1;
+        GlassMap testMap;
+
         // The part of Frame that looks behind the glass, from the card's position onwards. True if the backdrop changed.
         public bool Step(GlassPeekInput i, GlassMap map, Point origin, int lookTick)
         {
+            int[] test = TestScreen;
+            if (test != null)
+            {
+                if (backdrop.HasPicture && origin == testAt && testDone == TestVersion && ReferenceEquals(map, testMap)) return false;
+                testAt = origin;
+                testDone = TestVersion;
+                testMap = map;
+                bool changed = backdrop.ReadPicture(map, test, TestW, TestH, origin.X + TestShift.X, origin.Y + TestShift.Y);
+                if (changed) LastBackdropChange = lookTick;
+                return changed;
+            }
             // Never photograph the screen while the glass itself could be in the picture.
             bool safeToLook = layer.Excluded || !i.LayerVisible();
             bool backdropChanged = false;

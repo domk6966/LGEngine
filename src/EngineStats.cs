@@ -39,6 +39,10 @@ namespace LGEngine
         public static long PromptPeeks;         // looks behind the glass taken at once because something there changed
         public static long SelfChangesIgnored;  // screen changes the glass caused itself, and so did not look at
 
+        // The surface service's latency in ms (call -> frame start, call -> handed to Windows, call -> next vblank): the figures of
+        // the newest GlassSurface.Latency snapshot taken by anyone (the last surface read wins). 0 until one is taken.
+        public static double LatencyQueueP50, LatencyQueueP99, LatencyPresentP50, LatencyPresentP99, LatencyVblankP50, LatencyVblankP99;
+
         static int surfaces;
         // How many glass surfaces are up (notifications, indicators, taskbar, search box ...) right now.
         public static int ActiveSurfaces { get { return Thread.VolatileRead(ref surfaces); } }

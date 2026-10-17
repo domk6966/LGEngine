@@ -376,8 +376,13 @@ namespace LGEngine
         // only moves every 15 ms or so, which would let a frame in four slip by).
         internal static long Fine()
         {
+            long frozen = TestFine;
+            if (frozen != 0) return frozen;
             return System.Diagnostics.Stopwatch.GetTimestamp() * 1000 / System.Diagnostics.Stopwatch.Frequency + 1;
         }
+
+        // A test seam (the bench, nothing else): when not 0, the fine clock stands at this value until it is set again.
+        internal static long TestFine;
 
         void GiveUp(string why)
         {

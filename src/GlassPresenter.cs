@@ -131,6 +131,9 @@ namespace LGEngine
         float even, evenGoal;               // 0 even backdrop, 1 lopsided
         int appearanceTick;                 // when it last moved on; 0 until a pop-up has its first picture
 
+        // A test seam (the bench, nothing else): while not 0, the clock Adapt eases by.
+        internal static int TestTick;
+
         public bool LightGoal { get { return appearanceGoal > 0.5f; } }
         // Still turning light or dark, or being evened out.
         public bool Adapting { get { return appearance != appearanceGoal || even != evenGoal; } }
@@ -160,7 +163,7 @@ namespace LGEngine
             }
             appearanceGoal = goal;
             evenGoal = evenAim;
-            int now = Environment.TickCount;
+            int now = TestTick != 0 ? TestTick : Environment.TickCount;
             if (appearanceTick == 0)
             {
                 appearanceTick = now | 1;
