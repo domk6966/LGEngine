@@ -210,12 +210,13 @@ a silent lgtoast capture and the OSD shown through the app's own preview (never 
    backdrop buffer, a changed flag, the counters.
 4. 4a DONE 2026-10-16 (proj13): LGEngine\src\GlassPresenter.cs = out buffers, map cache (FitMap), Adapt, Render, Present,
    counters; hooks for the glow, warp and taskbar dirty rows. 4b DONE (proj14): LGEngine\src\GlassAnimator.cs = Animate /
-   SetVisible / MotionNow / hover / press / vis / slide / Stretch / ApplyMotion. Step 5 is NEXT (in progress).
+   SetVisible / MotionNow / hover / press / vis / slide / Stretch / ApplyMotion. Steps 5 and 7 DONE (proj15, 21:09).
    Target, GlassSurfaceCore (engine, internal): map cache (SignatureFor / Make / spare / primed), Adapt, Animate, Render / Present (dirty
    rect, row strip), EngineStats. In: immutable SurfaceProps {place, card size, scale, opacity target, deform (slosh and morph arrive
    as a Deform), motion, look, shape + profile, interaction} + contents (premultiplied, dirty rect) + an OVERLAY plane composited
    after shading (the glow: replaces PaintGlow's write into outDib) + a row-strip hint (knob-only frames). Largest step.
-5. Design fixed 2026-10-16 (files flat in LGEngine\src; the build globs src\*.cs only):
+5. DONE 2026-10-16 (proj15, with step 7; two Opus reviews' 19 findings fixed). Design (files flat in LGEngine\src; the build
+   globs src\*.cs only):
    - GlassService becomes a sealed class: static Connect(GlassConnectOptions) (Mode Auto | InProcess | Host; phase 1 always
      in-process), Create(GlassSpec) -> GlassSurface, Dispose; static SelfTest() kept for LGBench.
    - GlassSpec: Kind (Card | Lens), Look, Profile string, Scale, Size (card px), Place (card top-left on screen), InShots,
@@ -238,7 +239,11 @@ a silent lgtoast capture and the OSD shown through the app's own preview (never 
 6. Move the users: SearchGlass first (own timer, present and ScreenGrab; simplest), then the OSD, then notifications, then the taskbar
    (TaskbarGlass becomes a surface kind "bar" whose renderer runs in the engine; last, it is the largest).
 7. The render thread: InProcessTransport runs 2-4 on one engine thread (HANDOFF 4.5), vblank-paced, windows created there. Measure
-   section 11 with a loopback transport.
+   section 11 with a loopback transport. DONE 2026-10-16 (proj15): GlassRenderThread.cs (STA, MsgWaitForMultipleObjectsEx + a
+   high-resolution waitable timer, zero wakeups idle); client-woken frames run at once, animation frames (NextMs <= 20 ms) snap to
+   the nearest vblank, peek gaps never earlier than asked; GlassMode.UiThread keeps the step-5 path for comparison. Step 2
+   (FrameClock) folded into it. Measured (LGBench -contract, 60 Hz): queue 0.2 / 2.2 ms, present 1.7 / 3.7 ms, call -> next
+   vblank 9.9 / 18.6 ms (p50 / p99); -service ~60 frames/s, no gap > 22 ms, idle wakeups 0.
 Phase 2 after 7: LGEngineHost.exe + LGEngine.Client.dll + PipeTransport as sections 1-8. The host is a second exe, so ship8's Smart
 App Control test-run must cover it too (extend ship8 then). Guessed size: steps 2 and 3 one session each, 4 two, 5-6 one or two, 7
 one, phase 2 two or three.
