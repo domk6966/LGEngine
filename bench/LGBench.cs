@@ -50,7 +50,7 @@ namespace LGBench
         static bool verbose;
         static readonly StringBuilder report = new StringBuilder();
 
-        static void Say(string format, params object[] args)
+        internal static void Say(string format, params object[] args)
         {
             string line = args.Length == 0 ? format : string.Format(CultureInfo.InvariantCulture, format, args);
             Console.WriteLine(line);
@@ -64,7 +64,7 @@ namespace LGBench
             foreach (Kind k in AllKinds) kinds.Add(k.Name);
             List<float> scales = new List<float>(AllScales);
             string wallpaper = @"C:\Windows\Web\Wallpaper\Windows\img0.jpg";
-            bool energy = false, check = false, timing = true, quick = false, zoom = false, elevation = false, service = false, probe = false, motion = false;
+            bool energy = false, check = false, timing = true, quick = false, zoom = false, elevation = false, service = false, contract = false, loopback = false, host = false, probe = false, motion = false, surface = false, hostmain = false;
             string ab = "", reportPath = null, sheetPath = null;
             for (int i = 0; i < args.Length; i++)
             {
@@ -91,6 +91,11 @@ namespace LGBench
                     case "-sheet": sheetPath = next; i++; break;
                     case "-motion": motion = true; break;
                     case "-service": service = true; break;
+                    case "-contract": contract = true; break;
+                    case "-loopback": loopback = true; break;
+                    case "-host": host = true; break;
+                    case "-surface": surface = true; break;
+                    case "-hostmain": hostmain = true; break;
                     case "-probe": probe = true; break;
                     case "-wallpaper": wallpaper = next; i++; break;
                     case "-report": reportPath = next; i++; break;
@@ -102,6 +107,12 @@ namespace LGBench
             {
                 scenes = new List<string>(new string[] { "busy", "wall" });
                 scales = new List<float>(new float[] { 2f });
+            }
+            if (service || contract || surface || hostmain)
+            {
+                // (the service checks stand alone: not the default timing run, and no scenes unless another mode needs them)
+                timing = false;
+                if (!check && !energy && !motion && !probe && !elevation && sheetPath == null && imgDir == null) scenes = new List<string>();
             }
             if (imgDir != null) Directory.CreateDirectory(imgDir);
             if (dumpDir != null) Directory.CreateDirectory(dumpDir);
@@ -158,6 +169,9 @@ namespace LGBench
             }
             if (probe) { Say(""); foreach (string kn in kinds) { Kind kind = Find(kn); foreach (float k in scales) Probe(kind, k, made[scenes[0]]); } }
             if (service) ServiceBench();
+            if (contract) Contract.Run(loopback, host);
+            if (surface) SurfaceBench.Run();
+            if (hostmain) HostBench.Run();
             if (reportPath != null) File.WriteAllText(reportPath, report.ToString());
             return 0;
         }
@@ -178,7 +192,12 @@ namespace LGBench
             Console.WriteLine("  -sheet FILE           one png: every kind (rows) over every scene (columns) at the first scale");
             Console.WriteLine("  -motion               the glass moving (arrival, 2 s of hover, a press, a level ripple): CPU ms per event");
             Console.WriteLine("  -service              the surface service's thread: wakeups, pacing jitter, idle cost");
-            Console.WriteLine("  -report FILE          also write the output to a file");
+            Console.WriteLine("  -contract             the public surface API off screen: show, burst of calls, latency, invalid input");
+            Console.WriteLine("  -loopback             with -contract: the same over a GlassHostServer in this process (real pipe, sections, events)");
+            Console.WriteLine("  -host                 with -contract: the same against the INSTALLED LGEngineHost.exe (env LGENGINE_HOST, else beside a running LiquidGlass.exe, else beside this exe), started on demand (then a kill test); skipped if none");
+            Console.WriteLine("  -surface              the app's glass through the surface API vs the direct path, pixel for pixel (step 6)");
+            Console.WriteLine("  -hostmain             the host process's runner in memory: single instance, idle exit, log ring (phase 2b)");
+            Console.WriteLine("  -report FILE       also write the output to a file");
         }
 
         static Kind Find(string name)
@@ -873,6 +892,50 @@ namespace LGBench
         {
             Say("");
             Say(GlassService.SelfTest());
+            GlassService svc = GlassService.Connect(new GlassConnectOptions { Mode = GlassMode.InProcess });
+            try
+            {
+                GlassSpec spec = Contract.Spec("LGBench service test (off screen)");
+                spec.AnimIn = 1200;
+                GlassSurface s = svc.Create(spec);
+                int hidden = 0;
+                s.Hidden += delegate { System.Threading.Interlocked.Increment(ref hidden); };
+                s.SetContents(new int[spec.Size.Width * spec.Size.Height], spec.Size.Width, spec.Size.Height, Rectangle.Empty);
+                // 2 s of animation: the card arrives (1.2 s) and from 1.0 s on glides back and forth (the first glide goes away from
+                // where it is: a glide to its own place would leave a gap with nothing to animate after the arrival)
+                Stopwatch sw = Stopwatch.StartNew();
+                int k = 0;
+                s.Show();
+                while (sw.ElapsedMilliseconds < 2000)
+                {
+                    if (sw.ElapsedMilliseconds > 1000 + k * 300)
+                    {
+                        s.SetPlace(new Point(-10000 + ((k + 1) % 2) * 700, -10000), true);
+                        k++;
+                    }
+                    Contract.Pump(5, null);
+                }
+                GlassPacingInfo busy = svc.Pacing;
+                Say("service [{0}]: animating 2.0 s: paced frames {1}, presented by a call {2}; pacing jitter |start - intended| mean {3:0.00} ms p99 {4:0.00} ms; presented before the targeted vblank {5:0}%",
+                    svc.Transport, busy.Frames, s.Frames, busy.MeanJitterMs, busy.P99JitterMs, busy.BeforeVblankShare * 100);
+                // idle: hidden, nothing due
+                s.Hide();
+                Contract.Pump(4000, delegate { return System.Threading.Thread.VolatileRead(ref hidden) > 0; });
+                Contract.Pump(300, null);
+                long w0 = svc.Pacing.Wakeups;
+                TimeSpan cpu0 = Process.GetCurrentProcess().TotalProcessorTime;
+                Stopwatch idle = Stopwatch.StartNew();
+                System.Threading.Thread.Sleep(2000);
+                double secs = idle.Elapsed.TotalSeconds;
+                long wakes = svc.Pacing.Wakeups - w0;
+                double cpuMs = (Process.GetCurrentProcess().TotalProcessorTime - cpu0).TotalMilliseconds;
+                Say("service [{0}]: idle {1:0.0} s: render-thread wakeups {2} ({3:0.0}/s), process cpu {4:0} ms; {5}",
+                    svc.Transport, secs, wakes, wakes / secs, cpuMs, svc.Pacing);
+            }
+            finally
+            {
+                svc.Dispose();
+            }
         }
     }
 }
