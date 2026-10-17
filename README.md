@@ -1,4 +1,6 @@
-﻿# LGEngine
+# LGEngine
+
+Version 1.0.0 — initial release.
 
 The rendering engine behind Liquid Glass: Apple-style "liquid glass" surfaces for Windows (notifications, the
 volume/brightness indicator, a search box, a dock), drawn over the live desktop.
@@ -9,8 +11,11 @@ C# 5 on .NET Framework 4.x. No SDK, no packages: it builds with the C# compiler 
 
     powershell -ExecutionPolicy Bypass -File .\build.ps1
 
-Makes `bin\LGEngine.dll` (the engine) and `bin\LGBench.exe` (an off-screen benchmark and picture maker;
-`bin\LGBench.exe -help`).
+Makes `bin\LGEngine.dll` (the engine), `bin\LGEngineHost.exe` (the shared per-user host process) and `bin\LGBench.exe`
+(an off-screen benchmark and picture maker; `bin\LGBench.exe -help`). `.\build-client.ps1` makes `bin\LGEngine.Client.dll`,
+the small library other apps reference to use the host.
+
+**Using the engine from your own app: `docs\CLIENTS.md`** (start the host, connect, create glass surfaces).
 
 ## What it does
 
@@ -31,13 +36,18 @@ Makes `bin\LGEngine.dll` (the engine) and `bin\LGBench.exe` (an off-screen bench
 ## Status
 
 - CPU backend: complete and in daily use.
-- Background service, so other apps can drive the engine: in progress; design and build plan in `docs\SERVICE.md`
-  (section 12). In the engine now: the whole per-window glass runtime, moved out of the app: the layered window
+- Background service, so other apps can drive the engine: ready on the CPU (how to use it: `docs\CLIENTS.md`; design:
+  `docs\SERVICE.md`). `host\HostMain.cs` + `src\GlassHostRunner.cs` = the host process (one per user, current-user-only
+  pipe and shared memory, started on demand by the client, exits when idle); `src\GlassHostServer.cs`,
+  `src\PipeTransport.cs`, `src\GlassProtocol.cs`, `src\GlassSection.cs` = the wire. Restarts are handled: a client that
+  dies is cleaned up by the host; a host that dies is started again and every surface comes back. In the engine now: the whole per-window glass runtime, moved out of the app: the layered window
   (`src\GlassLayer.cs`), the backdrop tap and scheduling (`src\GlassPeek.cs`), rendering and presenting
-  (`src\GlassPresenter.cs`) and the show/hide/hover animation (`src\GlassAnimator.cs`). Still to come: the public
-  surface API (`GlassService` / `GlassSurface`, in-process first; built, not yet reviewed, so not in this export), a
-  render thread with vblank pacing, and the host process + client library over a named pipe with shared memory, with
-  measured call-to-screen latency.
+  (`src\GlassPresenter.cs`) and the show/hide/hover animation (`src\GlassAnimator.cs`). Also in: the public surface
+  API (`src\GlassService.cs`, `src\GlassSurface.cs`), run in-process on the engine's own render thread with vblank
+  pacing (`src\GlassRenderThread.cs`), with measured latency (`src\GlassLatency.cs`; call to next vblank ~10 ms p50,
+  ~19 ms p99 at 60 Hz; `bin\LGBench.exe -contract`, `-contract -loopback`, `-contract -host`, `-hostmain`).
+- Liquid Glass's own notifications and volume/brightness indicator are drawn through this public surface API (in process,
+  UI-thread mode), proven pixel-identical to the old direct path by `bin\LGBench.exe -surface`.
 - GPU (Direct3D 11) backend: paused prototype in `gpu\` (see `gpu\PROGRESS.md`); not wired in.
 
 ## License
