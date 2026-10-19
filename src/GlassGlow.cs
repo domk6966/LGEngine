@@ -116,11 +116,21 @@ namespace LGEngine
                 p.Hit = b.Hit;
                 p.Mask = b.Mask;
                 p.MaskBox = b.MaskBox;
+                Rectangle need = Rectangle.FromLTRB((int)Math.Floor(p.Cx - p.Hx) - 1, (int)Math.Floor(p.Cy - p.Hy) - 1, (int)Math.Ceiling(p.Cx + p.Hx) + 1, (int)Math.Ceiling(p.Cy + p.Hy) + 1);
                 if (p.Mask == null || p.Mask.Length < p.MaskBox.Width * p.MaskBox.Height)
                 {
                     // (nothing of it is label)
-                    p.MaskBox = Rectangle.FromLTRB((int)Math.Floor(p.Cx - p.Hx) - 1, (int)Math.Floor(p.Cy - p.Hy) - 1, (int)Math.Ceiling(p.Cx + p.Hx) + 1, (int)Math.Ceiling(p.Cy + p.Hy) + 1);
+                    p.MaskBox = need;
                     p.Mask = new byte[p.MaskBox.Width * p.MaskBox.Height];
+                }
+                else if (!p.MaskBox.Contains(need))
+                {
+                    // (a mask cropped to the label, as a pipe client may send: Apply reads it over the whole piece, so it is widened, the rest not label)
+                    Rectangle mb = p.MaskBox, wide = Rectangle.Union(mb, need);
+                    byte[] m = new byte[wide.Width * wide.Height];
+                    for (int y = 0; y < mb.Height; y++) Array.Copy(p.Mask, y * mb.Width, m, (mb.Top - wide.Top + y) * wide.Width + (mb.Left - wide.Left), mb.Width);
+                    p.Mask = m;
+                    p.MaskBox = wide;
                 }
                 fresh.Add(p);
             }

@@ -66,11 +66,12 @@ namespace LGEngine
         // Size of the DWM timing structure the latency and pacing read (a check that its layout is right: 292).
         public static int TimingStructSize { get { return GlassVblank.StructSize; } }
 
-        // Never throws, except ArgumentException("HostPath must be a full path") for a HostPath that is not rooted.
+        // Never throws, except ArgumentException("HostPath must be a full path") for a HostPath that is not fully qualified
+        // (X:\... or \\server\share\...).
         public static GlassService Connect(GlassConnectOptions options)
         {
             GlassMode mode = options == null ? GlassMode.Auto : options.Mode;
-            if (options != null && !string.IsNullOrEmpty(options.HostPath) && !Path.IsPathRooted(options.HostPath))
+            if (options != null && !string.IsNullOrEmpty(options.HostPath) && !FullyQualified(options.HostPath))
                 throw new ArgumentException("HostPath must be a full path", "options");
 #if !LGCLIENT
             if (mode == GlassMode.UiThread) return new GlassService(new InProcessTransport(), GlassMode.UiThread);
@@ -97,6 +98,16 @@ namespace LGEngine
             }
 #endif
             return svc;
+        }
+
+        // X:\... or \\server\share\... ("/" counts as "\"). Path.IsPathRooted also takes "C:foo" and "\foo", which hang on the
+        // process's current drive or folder.
+        static bool FullyQualified(string p)
+        {
+            if (p.Length < 3) return false;
+            bool sep1 = p[1] == '\\' || p[1] == '/', sep2 = p[2] == '\\' || p[2] == '/';
+            if (p[1] == ':') return sep2 && ((p[0] >= 'A' && p[0] <= 'Z') || (p[0] >= 'a' && p[0] <= 'z'));
+            return (p[0] == '\\' || p[0] == '/') && sep1;
         }
 
         void Raise(SynchronizationContext ctx, bool lost)

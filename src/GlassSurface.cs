@@ -76,7 +76,13 @@ namespace LGEngine
         public byte[] Mask;                // box-sized, 255 where a pixel is label or mark; MaskBox is its box (null: nothing is label)
         public Rectangle MaskBox;
 
-        internal GlassButton Copy() { return (GlassButton)MemberwiseClone(); }
+        // (the render thread owns the copy once SetButtons returns: the mask is copied too, so the caller may reuse its array)
+        internal GlassButton Copy()
+        {
+            GlassButton c = (GlassButton)MemberwiseClone();
+            if (Mask != null) c.Mask = (byte[])Mask.Clone();
+            return c;
+        }
     }
 
     // The runtime tells the surface the glass has gone lighter or darker (called on the frame's thread, from inside the frame).
@@ -340,7 +346,8 @@ namespace LGEngine
         public event EventHandler<GlassFailedEventArgs> RequestRejected;
 
         // How light the glass is now, 0 (dark) to 1 (light), eased as the glass turns (the map's own appearance); and an event when it
-        // changes, raised like the others. Never raised over the pipe (and Light stays at its start value there).
+        // changes, raised like the others. Over the pipe only a host that speaks protocol 1.1 reports it (a coarser, throttled value);
+        // with an older host Light stays at its start value there.
         volatile float light = 0f;
         public float Light { get { return light; } }
         public event Action<float> LightMoved;
@@ -353,7 +360,7 @@ namespace LGEngine
         {
             add
             {
-                NeedLocal("BeforeRender");
+                NeedInProcess("BeforeRender");
                 lock (propGate) beforeRender += value;
             }
             remove { lock (propGate) beforeRender -= value; }
@@ -590,7 +597,8 @@ namespace LGEngine
             Publish(stamp, delegate(SurfaceProps n) { n.WantShown = false; });
         }
 
-        // ---- step 6: what the app's own glass needs (in-process modes only: each of these throws NotSupportedException over the pipe) ----
+        // ---- step 6: what the app's own glass needs (in process; over the pipe only with a host that speaks protocol 1.1: each of these
+        // throws NotSupportedException over the pipe to an older host) ----
 
         // A new card size and its picture in one step: the glass never shows the new size with blank contents. flow: the glass
         // flows to the new width (another indicator taking over: clamp 0.86..1.16, 260 ms, only once fully in; a lens only).
@@ -731,7 +739,17 @@ namespace LGEngine
             Publish(stamp, delegate(SurfaceProps n) { n.Buttons = copy; n.ButtonsVer++; n.ButtonsCarry = carry; });
         }
 
+        // Over the pipe the step-6 calls need a host that speaks protocol 1.1: an old (minor 0) host throws. (A host whose minor is not
+        // known yet, or none connected, takes the call; it is sent when the host is known to speak 1.1.)
         void NeedLocal(string what)
+        {
+            if (!(channel is IGlassStats)) return;
+            PipeChannel pc = channel as PipeChannel;
+            if (pc == null || pc.HostMinor == 0) throw new NotSupportedException(what + " is not supported over the pipe" + (pc == null ? "" : " (the host speaks protocol 1.0 only)"));
+        }
+
+        // Never over the pipe: it runs inside the render thread's frame.
+        void NeedInProcess(string what)
         {
             if (channel is IGlassStats) throw new NotSupportedException(what + " is not supported over the pipe");
         }

@@ -36,13 +36,28 @@ namespace LGEngine
             public RenderSlot Slot;
             public volatile bool Closing;
             public bool Listed;   // (in `all`; the render thread's)
+            public HostEvents Events;
         }
 
-        // IGlassEvents for one host surface: the runtime's events become frames to the client.
-        sealed class HostEvents : IGlassEvents
+        // IGlassEvents for one host surface: the runtime's events become frames to the client. The light goes only to a client that
+        // said it speaks protocol 1.1, and only when it moved by 0.02 (or reached exactly 0 or 1): the runtime reports every change.
+        sealed class HostEvents : IGlassEvents, IGlassLightEvents
         {
             readonly HostSurface s;
+            float lastLight = float.NaN;   // (the render thread's: the last value sent; none yet, so that a re-created surface says where it is)
             public HostEvents(HostSurface s) { this.s = s; }
+
+            public void LightMoved(float light)
+            {
+                if (s.Closing || s.Owner.Minor < 1 || float.IsNaN(light) || float.IsInfinity(light)) return;
+                bool edge = (light == 0f || light == 1f) && light != lastLight;
+                if (!edge && !float.IsNaN(lastLight) && Math.Abs(light - lastLight) < 0.02f) return;
+                lastLight = light;
+                PayloadWriter w = new PayloadWriter();
+                w.U32(s.Id);
+                w.F32(light);
+                Out(Msg.LightMoved, w);
+            }
 
             void Out(int type, PayloadWriter w)
             {
@@ -70,13 +85,14 @@ namespace LGEngine
             double tokens = RateBurst;
             long tokenAt = System.Diagnostics.Stopwatch.GetTimestamp();
             volatile bool hello;
-            int errors;                                                    // protocol violations (Interlocked); halved every 10 s
+            public volatile int Minor;   // the session's protocol minor: min(the client's, ours); 0 for a Hello that carried none
+            int errors;                                                   // protocol violations (Interlocked); halved every 10 s
             long errorsAt = System.Diagnostics.Stopwatch.GetTimestamp();   // (Interlocked)
             // Over the rate, a SetLook / Resize waits here (only the newest per surface) until the bucket has refilled.
             sealed class DeferredLook { public GlassLook Look; public string Profile; }
-            sealed class DeferredResize { public uint Seq; public int W, H; }
+            sealed class DeferredResize { public uint Seq; public int W, H; public bool Flow; }
             readonly object errGate = new object();
-            readonly Dictionary<uint, long> errSentAt = new Dictionary<uint, long>();   // surface id -> when the last throttled Error went out (errGate)
+            readonly Dictionary<ulong, long> errSentAt = new Dictionary<ulong, long>();   // (surface id, message class) -> when the last throttled Error went out (errGate)
             readonly object deferGate = new object();
             readonly Dictionary<uint, DeferredLook> deferLook = new Dictionary<uint, DeferredLook>();
             readonly Dictionary<uint, DeferredResize> deferResize = new Dictionary<uint, DeferredResize>();
@@ -136,12 +152,17 @@ namespace LGEngine
                     Interlocked.Increment(ref errors);
                 }
                 long now = System.Diagnostics.Stopwatch.GetTimestamp();
+                // the class is the message the Error is about (the text up to its colon: "setlook", "resize", "kick" ...), so that a
+                // throttled Error of an extra can never swallow the Error of a Resize or a SetLook
+                int colon = text == null ? -1 : text.IndexOf(':');
+                string cls = text == null ? "" : (colon < 0 ? text : text.Substring(0, colon));
+                ulong key = ((ulong)(uint)cls.GetHashCode() << 32) | id;
                 lock (errGate)
                 {
                     long at;
-                    if (errSentAt.TryGetValue(id, out at) && now - at < System.Diagnostics.Stopwatch.Frequency / 10) return;
+                    if (errSentAt.TryGetValue(key, out at) && now - at < System.Diagnostics.Stopwatch.Frequency / 10) return;
                     if (errSentAt.Count >= 256) errSentAt.Clear();
-                    errSentAt[id] = now;
+                    errSentAt[key] = now;
                 }
                 SendError(seq, code, text);
             }
@@ -266,10 +287,14 @@ namespace LGEngine
                     string name = r.Str(256);
                     if (r.Bad) { Error(seq, WireError.BadPayload, "hello: bad payload"); return false; }
                     if (min > GlassFrame.Version || max < GlassFrame.Version) { Error(seq, WireError.BadVersion, "no common protocol version (host speaks " + GlassFrame.Version + ")"); return false; }
+                    bool carried = r.Remaining >= 2;   // (protocol 1.1: an optional trailing u16, the client's minor)
+                    int clientMinor = carried ? r.U16() : 0;
+                    Minor = Math.Min(clientMinor, GlassFrame.Minor);
                     hello = true;
                     PayloadWriter w = new PayloadWriter();
                     w.U16(GlassFrame.Version);
                     w.Str("LGEngine host");
+                    if (carried) w.U16(GlassFrame.Minor);   // (a client that sent none gets the v1 ack, byte for byte)
                     Send(Msg.HelloAck, seq, w.ToArray());
                     return true;
                 }
@@ -287,6 +312,17 @@ namespace LGEngine
                     case Msg.Destroy: OnDestroy(seq, r); break;
                     case Msg.SetLook: OnSetLook(seq, r, allowed); break;
                     case Msg.Stats: OnStats(seq, r); break;
+                    case Msg.SetMotionEx:
+                    case Msg.SetSlosh:
+                    case Msg.Kick:
+                    case Msg.SetButtons:
+                    case Msg.SetPointerArea:
+                    case Msg.SetUpdates:
+                    case Msg.SetBusy:
+                    case Msg.Cut:
+                        if (Minor >= 1) OnExtra(type, seq, r, allowed);   // (protocol 1.1 only; to a minor-0 session they are unknown types, as before)
+                        else Error(seq, WireError.Unsupported, "message type " + type + " is not supported");
+                        break;
                     default: Error(seq, WireError.Unsupported, "message type " + type + " is not supported"); break;
                 }
                 return true;
@@ -343,6 +379,7 @@ namespace LGEngine
                 uint id = r.U32();
                 int w = r.I32(), h = r.I32();
                 if (r.Bad) { Error(seq, WireError.BadPayload, "resize: bad payload"); return; }
+                bool flow = Minor >= 1 && r.Remaining >= 4 && (r.U32() & 1u) != 0;   // (the old reserved u32: bit0 = flow, for protocol 1.1 sessions)
                 // (validated before it is coalesced; over the rate an Error is throttled per surface and counts as a violation)
                 HostSurface s = Find(id);
                 if (s == null) { ResizeError(allowed, id, seq, WireError.NoSurface, "resize: no such surface"); return; }
@@ -357,7 +394,7 @@ namespace LGEngine
                     if (allowed)
                     {
                         deferResize.Remove(id);   // (an older one that was waiting is superseded)
-                        PostResize(s, w, h, seq);
+                        PostResize(s, w, h, seq, flow);
                     }
                     else
                     {
@@ -365,6 +402,7 @@ namespace LGEngine
                         d.Seq = seq;
                         d.W = w;
                         d.H = h;
+                        d.Flow = flow;
                         deferResize[id] = d;
                         ArmFlush();
                     }
@@ -379,9 +417,9 @@ namespace LGEngine
                 else ErrorLimited(id, seq, code, text, true);
             }
 
-            void PostResize(HostSurface s, int w, int h, uint seq)
+            void PostResize(HostSurface s, int w, int h, uint seq, bool flow)
             {
-                if (!PostHost(delegate { Host.ResizeOnThread(s, w, h, seq); })) Error(seq, WireError.Internal, "the host is shutting down");
+                if (!PostHost(delegate { Host.ResizeOnThread(s, w, h, seq, flow); })) Error(seq, WireError.Internal, "the host is shutting down");
             }
 
             public const int BytesOk = 0, BytesGone = 1, BytesOver = 2;
@@ -435,7 +473,7 @@ namespace LGEngine
                             DeferredResize d = deferResize[id];
                             deferResize.Remove(id);
                             HostSurface s = Find(id);
-                            if (s != null) PostResize(s, d.W, d.H, d.Seq);
+                            if (s != null) PostResize(s, d.W, d.H, d.Seq, d.Flow);
                             else ErrorLimited(id, d.Seq, WireError.NoSurface, "resize: no such surface", false);
                         }
                         if (deferLook.Count > 0 || deferResize.Count > 0) ArmFlush();
@@ -498,6 +536,85 @@ namespace LGEngine
                         ArmFlush();
                     }
                 }
+            }
+
+            // Protocol 1.1 (session minor >= 1): the extras of the in-process surface. Checked like SetLook (the Errors are throttled per
+            // surface); nothing is sent back on success. Over the rate Handle has already waited for a token: they are never deferred.
+            void OnExtra(int type, uint seq, PayloadReader r, bool allowed)
+            {
+                uint id = r.U32();
+                string what = type == Msg.SetMotionEx ? "setmotionex" : type == Msg.SetSlosh ? "setslosh" : type == Msg.Kick ? "kick" : type == Msg.SetButtons ? "setbuttons"
+                    : type == Msg.SetPointerArea ? "setpointerarea" : type == Msg.SetUpdates ? "setupdates" : type == Msg.SetBusy ? "setbusy" : "cut";
+                bool ok = true;
+                string badText = null;
+                Action<HostSurface> work = null;
+                switch (type)
+                {
+                    case Msg.SetMotionEx:
+                        {
+                            int zoom = r.I32(), liquid = r.I32(), bounce = r.I32(), travel = r.I32(), ind = r.I32();
+                            ok = In(zoom, -1, 50) && In(liquid, -1, 100) && In(bounce, -1, 100) && In(travel, -1, 160) && In(ind, -1, 8);
+                            work = delegate(HostSurface s)
+                            {
+                                Host.ExtraOnThread(s, delegate(SurfaceProps n) { n.MotionZoom = zoom; n.MotionLiquid = liquid; n.MotionBounce = bounce; n.MotionTravel = travel; n.OsdStyle = ind; });
+                            };
+                        }
+                        break;
+                    case Msg.SetSlosh:
+                        {
+                            int style = r.I32(), amount = r.I32();
+                            ok = In(style, 0, 3) && In(amount, 0, 100);
+                            work = delegate(HostSurface s) { Host.ExtraOnThread(s, delegate(SurfaceProps n) { n.SloshStyle = style; n.SloshAmount = amount; }); };
+                        }
+                        break;
+                    case Msg.Kick:
+                        {
+                            float push = r.F32();
+                            ok = Finite(push) && Math.Abs(push) <= 8f;
+                            work = delegate(HostSurface s) { Host.KickOnThread(s, push); };
+                        }
+                        break;
+                    case Msg.SetButtons:
+                        {
+                            bool carry;
+                            GlassButton[] buttons;
+                            badText = GlassWire.ReadButtons(r, out carry, out buttons);
+                            ok = badText == null;
+                            work = delegate(HostSurface s) { Host.ExtraOnThread(s, delegate(SurfaceProps n) { n.Buttons = buttons == null || buttons.Length == 0 ? null : buttons; n.ButtonsVer++; n.ButtonsCarry = carry; }); };
+                        }
+                        break;
+                    case Msg.SetPointerArea:
+                        {
+                            int x = r.I32(), y = r.I32(), w = r.I32(), h = r.I32();
+                            ok = In(x, -100000, 100000) && In(y, -100000, 100000);
+                            bool has = w > 0 && h > 0;
+                            Rectangle area = has ? new Rectangle(x, y, Math.Min(w, 200000), Math.Min(h, 200000)) : Rectangle.Empty;
+                            work = delegate(HostSurface s) { Host.ExtraOnThread(s, delegate(SurfaceProps n) { n.HasPointer = has; n.Pointer = area; }); };
+                        }
+                        break;
+                    case Msg.SetUpdates:
+                        {
+                            int fps = r.I32(), adapt = r.U8(), save = r.U8();
+                            ok = In(fps, 0, 60) && In(adapt, 0, 1) && In(save, 0, 1);
+                            work = delegate(HostSurface s) { Host.ExtraOnThread(s, delegate(SurfaceProps n) { n.Fps = fps; n.Adapt = adapt; n.SavePower = save; }); };
+                        }
+                        break;
+                    case Msg.SetBusy:
+                        {
+                            int busy = r.U8();
+                            ok = In(busy, 0, 1);
+                            work = delegate(HostSurface s) { Host.ExtraOnThread(s, delegate(SurfaceProps n) { n.Busy = busy == 1; }); };
+                        }
+                        break;
+                    default:   // Cut
+                        work = delegate(HostSurface s) { Host.CutOnThread(s); };
+                        break;
+                }
+                if (r.Bad || (!ok && badText == "bad payload")) { ErrorLimited(0, seq, WireError.BadPayload, what + ": bad payload", !allowed); return; }
+                if (!ok) { ErrorLimited(id, seq, WireError.BadPayload, what + ": " + (badText ?? "a value is out of range"), !allowed); return; }
+                HostSurface target = Find(id);
+                if (target == null) { ErrorLimited(id, seq, WireError.NoSurface, what + ": no such surface", !allowed); return; }
+                PostHost(delegate { work(target); });   // (a host that is stopping retires the surface itself)
             }
 
             void OnStats(uint seq, PayloadReader r)
@@ -608,6 +725,46 @@ namespace LGEngine
                     return true;
                 }
             return false;
+        }
+
+        HostSurface FindByLabel(string label)
+        {
+            Session[] ss;
+            lock (gate) ss = sessions.ToArray();
+            foreach (Session se in ss)
+                foreach (HostSurface hs in se.Snapshot())
+                    if (hs.Spec.Label == label) return hs;
+            return null;
+        }
+
+        // For tests: the protocol 1.1 extras the host holds for the surface with this label, as "key=value;" text (null: no such surface).
+        public string TestProps(string label)
+        {
+            HostSurface hs = FindByLabel(label);
+            SurfaceProps p = hs == null ? null : hs.State.Props;
+            if (p == null) return null;
+            System.Globalization.CultureInfo ic = System.Globalization.CultureInfo.InvariantCulture;
+            string b = "";
+            if (p.Buttons != null)
+            {
+                GlassButton g = p.Buttons.Length > 0 ? p.Buttons[0] : null;
+                b = p.Buttons.Length + "/" + (g == null ? "-" : g.Style + "," + g.Hit.X + "," + g.Rad.ToString("0.#", ic) + "," + (g.Mask == null ? 0 : g.Mask.Length));
+            }
+            return "mz=" + p.MotionZoom + ";ml=" + p.MotionLiquid + ";mb=" + p.MotionBounce + ";mt=" + p.MotionTravel + ";os=" + p.OsdStyle
+                + ";ss=" + p.SloshStyle + ";sa=" + p.SloshAmount + ";kv=" + p.KickVer + ";bv=" + p.ButtonsVer + ";bc=" + (p.ButtonsCarry ? 1 : 0) + ";b=" + b
+                + ";hp=" + (p.HasPointer ? 1 : 0) + ";pa=" + p.Pointer.X + "," + p.Pointer.Y + "," + p.Pointer.Width + "," + p.Pointer.Height
+                + ";fps=" + p.Fps + ";ad=" + p.Adapt + ";sp=" + p.SavePower + ";busy=" + (p.Busy ? 1 : 0) + ";cv=" + p.CutVer + ";want=" + (p.WantShown ? 1 : 0)
+                + ";fv=" + p.FlowVer + ";ff=" + p.FlowFrom.ToString("0.###", ic) + ";w=" + p.Size.Width + ";";
+        }
+
+        // For tests: the surface with this label reports a light value to its client, as the runtime does (through the same throttle).
+        public bool TestLight(string label, float light)
+        {
+            HostSurface hs = FindByLabel(label);
+            GlassRenderThread t = thread;
+            if (hs == null || hs.Events == null || t == null) return false;
+            HostEvents ev = hs.Events;
+            return t.Post(delegate { ev.LightMoved(light); });
         }
 
         // Opens the pipe and the wake event and starts the render thread. Throws if another host owns the names.
@@ -878,7 +1035,8 @@ namespace LGEngine
                 s.Mirror = new int[w * h];
                 s.State.Contents.Reset(w, h);
                 s.State.Props = s.Cur;
-                s.Slot = thread.Open(s.Spec, new HostEvents(s), s.State);
+                s.Events = new HostEvents(s);
+                s.Slot = thread.Open(s.Spec, s.Events, s.State);
                 s.Listed = true;
                 all.Add(s);
                 PayloadWriter p = new PayloadWriter();
@@ -900,7 +1058,7 @@ namespace LGEngine
             }
         }
 
-        void ResizeOnThread(HostSurface s, int w, int h, uint seq)
+        void ResizeOnThread(HostSurface s, int w, int h, uint seq, bool flow)
         {
             if (s.Closing || s.Section == null)
             {
@@ -937,9 +1095,15 @@ namespace LGEngine
                 s.Mirror = mirror;
                 s.LastP = 0;
                 s.LastClientVer = -1;
+                int was = s.Cur.Size.Width;   // (the width before this resize, for the flow)
                 SurfaceProps n = s.Cur.Copy();
                 n.Size = new Size(w, h);
                 n.SizeVer++;
+                if (flow && was > 0)   // (protocol 1.1: the glass flows to the new width, as SetSize(size, contents, flow) does in process)
+                {
+                    n.FlowFrom = Math.Max(0.86f, Math.Min(1.16f, was / (float)w));
+                    n.FlowVer++;
+                }
                 n.Version = ++s.HostVer;
                 s.Cur = n;
                 s.State.Props = n;
@@ -978,6 +1142,36 @@ namespace LGEngine
             if (s.Slot != null) s.Slot.Wake();
         }
 
+        // Protocol 1.1: a change of the extras, published the way a look is.
+        void ExtraOnThread(HostSurface s, Action<SurfaceProps> change)
+        {
+            if (s.Closing) return;
+            SurfaceProps n = s.Cur.Copy();
+            change(n);
+            n.Version = ++s.HostVer;
+            s.Cur = n;
+            s.State.Props = n;
+            if (s.Slot != null) s.Slot.Wake();
+        }
+
+        // A kick to the slosh, only while the surface sloshes at all (the client worked out the push; it may have sent it before SetSlosh took effect).
+        void KickOnThread(HostSurface s, float push)
+        {
+            if (s.Closing) return;
+            if (s.Cur.SloshAmount <= 0 || s.Cur.SloshStyle >= 3) return;
+            s.State.AddKick(push);
+            ExtraOnThread(s, delegate(SurfaceProps n) { n.KickVer++; });
+        }
+
+        // Gone at once. The client sends the Cut BEFORE it publishes the state block that says "hidden" (so that no animated hide
+        // starts first), and that block (or a later Show) is read by the next pump as usual. (Known: a Show block that the pump read
+        // before this ran is overridden by the cut; the client does not send one within the same instant of a cut.)
+        void CutOnThread(HostSurface s)
+        {
+            if (s.Closing) return;
+            ExtraOnThread(s, delegate(SurfaceProps n) { n.WantShown = false; n.CutVer++; });
+        }
+
         void RetireOnThread(HostSurface s)
         {
             s.Closing = true;
@@ -987,6 +1181,8 @@ namespace LGEngine
         }
 
         static bool Finite(float f) { return !float.IsNaN(f) && !float.IsInfinity(f); }
+
+        static bool In(int v, int lo, int hi) { return v >= lo && v <= hi; }
 
         static float Bounded(float f, float lo, float hi, float dflt)
         {
@@ -1000,57 +1196,58 @@ namespace LGEngine
         // new contents are copied out of its section.
         void Pump()
         {
-            for (int i = 0; i < all.Count; i++)
+            for (int i = 0; i < all.Count; i++) PumpOne(all[i]);
+        }
+
+        void PumpOne(HostSurface s)
+        {
+            if (s.Closing || s.Section == null) return;
+            bool changed = false;
+            try
             {
-                HostSurface s = all[i];
-                if (s.Closing || s.Section == null) continue;
-                bool changed = false;
-                try
+                SectionState c;
+                if (s.Section.ReadState(out c) && c.Valid == 1 && c.Version != s.LastClientVer)
                 {
-                    SectionState c;
-                    if (s.Section.ReadState(out c) && c.Valid == 1 && c.Version != s.LastClientVer)
-                    {
-                        s.LastClientVer = c.Version;
-                        SurfaceProps n = s.Cur.Copy();
-                        n.WantShown = (c.Flags & GlassSection.FlagShown) != 0;
-                        n.PlaceAnimate = (c.Flags & GlassSection.FlagAnimate) != 0;
-                        n.Hover = (c.Flags & GlassSection.FlagHover) != 0;
-                        n.UseBend = (c.Flags & GlassSection.FlagBend) != 0;
-                        n.Place = new Point(Clamp(c.X, -100000, 100000), Clamp(c.Y, -100000, 100000));
-                        n.Opacity = Bounded(c.Opacity, 0f, 1f, 1f);
-                        Deform d = new Deform();
-                        d.ZoomX = Bounded(c.ZoomX, 0f, 8f, 1f);
-                        d.ZoomY = Bounded(c.ZoomY, 0f, 8f, 1f);
-                        d.LeanX = Bounded(c.LeanX, -8f, 8f, 0f);
-                        d.LeanY = Bounded(c.LeanY, -8f, 8f, 0f);
-                        d.Swell = Bounded(c.Swell, -8f, 8f, 0f);
-                        n.Bend = d;
-                        n.MotionStyle = Clamp(c.MotionStyle, 0, 8);
-                        n.MotionIn = Clamp(c.MotionIn, 60, 1200);
-                        n.MotionOut = Clamp(c.MotionOut, 60, 1200);
-                        Rectangle card = new Rectangle(0, 0, s.Section.W, s.Section.H);
-                        Rectangle hr = c.Hover;
-                        long right = (long)hr.X + hr.Width, bottom = (long)hr.Y + hr.Height;
-                        if (hr.Width <= 0 || hr.Height <= 0 || right > int.MaxValue || bottom > int.MaxValue) hr = Rectangle.Empty;
-                        else { hr.Intersect(card); if (hr.Width <= 0 || hr.Height <= 0) hr = Rectangle.Empty; }
-                        n.HoverRegion = hr;
-                        n.CallStamp = c.Stamp;
-                        n.Version = ++s.HostVer;
-                        s.Cur = n;
-                        s.State.Props = n;
-                        changed = true;
-                    }
-                    Rectangle dirty;
-                    if (s.Section.ReadContents(s.Mirror, ref s.LastP, out dirty) == 1)
-                    {
-                        s.State.Contents.Put(s.Mirror, s.Section.W, s.Section.H, dirty);
-                        changed = true;
-                    }
+                    s.LastClientVer = c.Version;
+                    SurfaceProps n = s.Cur.Copy();
+                    n.WantShown = (c.Flags & GlassSection.FlagShown) != 0;
+                    n.PlaceAnimate = (c.Flags & GlassSection.FlagAnimate) != 0;
+                    n.Hover = (c.Flags & GlassSection.FlagHover) != 0;
+                    n.UseBend = (c.Flags & GlassSection.FlagBend) != 0;
+                    n.Place = new Point(Clamp(c.X, -100000, 100000), Clamp(c.Y, -100000, 100000));
+                    n.Opacity = Bounded(c.Opacity, 0f, 1f, 1f);
+                    Deform d = new Deform();
+                    d.ZoomX = Bounded(c.ZoomX, 0f, 8f, 1f);
+                    d.ZoomY = Bounded(c.ZoomY, 0f, 8f, 1f);
+                    d.LeanX = Bounded(c.LeanX, -8f, 8f, 0f);
+                    d.LeanY = Bounded(c.LeanY, -8f, 8f, 0f);
+                    d.Swell = Bounded(c.Swell, -8f, 8f, 0f);
+                    n.Bend = d;
+                    n.MotionStyle = Clamp(c.MotionStyle, 0, 8);
+                    n.MotionIn = Clamp(c.MotionIn, 60, 1200);
+                    n.MotionOut = Clamp(c.MotionOut, 60, 1200);
+                    Rectangle card = new Rectangle(0, 0, s.Section.W, s.Section.H);
+                    Rectangle hr = c.Hover;
+                    long right = (long)hr.X + hr.Width, bottom = (long)hr.Y + hr.Height;
+                    if (hr.Width <= 0 || hr.Height <= 0 || right > int.MaxValue || bottom > int.MaxValue) hr = Rectangle.Empty;
+                    else { hr.Intersect(card); if (hr.Width <= 0 || hr.Height <= 0) hr = Rectangle.Empty; }
+                    n.HoverRegion = hr;
+                    n.CallStamp = c.Stamp;
+                    n.Version = ++s.HostVer;
+                    s.Cur = n;
+                    s.State.Props = n;
+                    changed = true;
                 }
-                catch (Exception) { }
-                // (no Signal: RunDue follows in this same loop iteration)
-                if (changed && s.Slot != null) Interlocked.Exchange(ref s.Slot.Woken, 1);
+                Rectangle dirty;
+                if (s.Section.ReadContents(s.Mirror, ref s.LastP, out dirty) == 1)
+                {
+                    s.State.Contents.Put(s.Mirror, s.Section.W, s.Section.H, dirty);
+                    changed = true;
+                }
             }
+            catch (Exception) { }
+            // (no Signal: RunDue follows in this same loop iteration)
+            if (changed && s.Slot != null) Interlocked.Exchange(ref s.Slot.Woken, 1);
         }
     }
 }

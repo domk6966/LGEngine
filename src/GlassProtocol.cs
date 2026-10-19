@@ -258,6 +258,9 @@ namespace LGEngine
     {
         public const int Hello = 1, HelloAck = 2, Create = 3, CreateAck = 4, Destroy = 5, SetLook = 6, Resize = 7, Stats = 8, StatsReply = 9,
             Shown = 0x20, Hidden = 0x21, Appearance = 0x22, Failed = 0x23, Error = 0xFF;
+        // Protocol 1.1 (a Hello that carried a minor; session minor >= 1 only): the in-process extras, and the light event.
+        public const int SetMotionEx = 10, SetSlosh = 11, Kick = 12, SetButtons = 13, SetPointerArea = 14, SetUpdates = 15, SetBusy = 16, Cut = 17,
+            LightMoved = 0x24;
     }
 
     internal static class WireError
@@ -269,7 +272,7 @@ namespace LGEngine
     internal static class GlassFrame
     {
         public const uint Magic = 0x3145474C;
-        public const int Version = 1, HeaderSize = 16, MaxPayload = 65536, MaxFrame = HeaderSize + MaxPayload;
+        public const int Version = 1, Minor = 1, HeaderSize = 16, MaxPayload = 65536, MaxFrame = HeaderSize + MaxPayload;   // (Minor: protocol 1.1, additive)
 
         public static int Get32(byte[] b, int o) { return b[o] | (b[o + 1] << 8) | (b[o + 2] << 16) | (b[o + 3] << 24); }
 
@@ -334,6 +337,8 @@ namespace LGEngine
             ms.Write(b, 0, n);
         }
 
+        public void Raw(byte[] b) { ms.Write(b, 0, b.Length); }
+
         public byte[] ToArray() { return ms.ToArray(); }
     }
 
@@ -357,6 +362,17 @@ namespace LGEngine
         {
             if (Bad || n < 0 || end - pos < n) { Bad = true; return false; }
             return true;
+        }
+
+        public int Remaining { get { return end - pos; } }
+
+        public byte[] Bytes(int n)
+        {
+            if (!Need(n)) return new byte[0];
+            byte[] b = new byte[n];
+            Buffer.BlockCopy(buf, pos, b, 0, n);
+            pos += n;
+            return b;
         }
 
         public int U8() { if (!Need(1)) return 0; return buf[pos++]; }
@@ -439,6 +455,112 @@ namespace LGEngine
         public static bool ProfileValid(string profile)
         {
             return profile != null && profile.Length <= MaxProfileChars && GlassSurface.ProfileOk(profile);
+        }
+
+        // ---- protocol 1.1: SetButtons (13) ----
+
+        public const int MaxButtons = 32;
+
+        static bool RectOk(Rectangle r) { return In(r.Width, 0, 4096) && In(r.Height, 0, 4096) && In(r.X, -4096, 8192) && In(r.Y, -4096, 8192); }
+
+        static Rectangle RectFix(Rectangle r)
+        {
+            return new Rectangle(Math.Max(-4096, Math.Min(8192, r.X)), Math.Max(-4096, Math.Min(8192, r.Y)), Math.Max(0, Math.Min(4096, r.Width)), Math.Max(0, Math.Min(4096, r.Height)));
+        }
+
+        static float Fix(float v, bool nonNegative)
+        {
+            if (float.IsNaN(v) || float.IsInfinity(v)) return 0f;
+            return Math.Max(nonNegative ? 0f : -16384f, Math.Min(16384f, v));
+        }
+
+        static bool FloatOk(float v, bool nonNegative) { return !float.IsNaN(v) && !float.IsInfinity(v) && Math.Abs(v) <= 16384f && (!nonNegative || v >= 0f); }
+
+        static void WriteRect(PayloadWriter w, Rectangle r)
+        {
+            w.I32(r.X);
+            w.I32(r.Y);
+            w.I32(r.Width);
+            w.I32(r.Height);
+        }
+
+        static Rectangle ReadRect(PayloadReader r)
+        {
+            int x = r.I32(), y = r.I32(), w = r.I32(), h = r.I32();
+            return new Rectangle(x, y, w, h);
+        }
+
+        // The SetButtons payload (values clamped to what the host accepts). A frame over 64 KB is sent again without the masks.
+        public static byte[] Buttons(uint surface, GlassButton[] buttons, bool carry)
+        {
+            byte[] b = Buttons(surface, buttons, carry, true);
+            return b.Length > GlassFrame.MaxPayload ? Buttons(surface, buttons, carry, false) : b;
+        }
+
+        static byte[] Buttons(uint surface, GlassButton[] buttons, bool carry, bool masks)
+        {
+            PayloadWriter w = new PayloadWriter();
+            w.U32(surface);
+            w.U8(carry ? 1 : 0);
+            int n = buttons == null ? 0 : Math.Min(MaxButtons, buttons.Length);
+            w.U16(n);
+            for (int i = 0; i < n; i++)
+            {
+                GlassButton g = buttons[i];
+                WriteRect(w, RectFix(g.Hit));
+                w.F32(Fix(g.Cx, false));
+                w.F32(Fix(g.Cy, false));
+                w.F32(Fix(g.Hx, true));
+                w.F32(Fix(g.Hy, true));
+                w.F32(Fix(g.Rad, true));
+                w.I32(g.Style);
+                w.I32(g.Mark);
+                Rectangle box = RectFix(g.MaskBox);
+                WriteRect(w, box);
+                if (masks && g.Mask != null && box.Width * box.Height > 0 && g.Mask.Length == box.Width * box.Height && box.Width == g.MaskBox.Width && box.Height == g.MaskBox.Height)
+                {
+                    w.U32((uint)g.Mask.Length);
+                    w.Raw(g.Mask);
+                }
+                else w.U32(0);
+            }
+            return w.ToArray();
+        }
+
+        // null = fine (carry and the buttons are filled); else the text of the Error.
+        public static string ReadButtons(PayloadReader r, out bool carry, out GlassButton[] buttons)
+        {
+            buttons = null;
+            carry = r.U8() == 1;
+            int count = r.U16();
+            if (r.Bad) return "bad payload";
+            if (count > MaxButtons) return "more than " + MaxButtons + " buttons";
+            GlassButton[] a = new GlassButton[count];
+            for (int i = 0; i < count; i++)
+            {
+                GlassButton g = new GlassButton();
+                g.Hit = ReadRect(r);
+                g.Cx = r.F32();
+                g.Cy = r.F32();
+                g.Hx = r.F32();
+                g.Hy = r.F32();
+                g.Rad = r.F32();
+                g.Style = r.I32();
+                g.Mark = r.I32();
+                g.MaskBox = ReadRect(r);
+                uint maskLen = r.U32();
+                if (r.Bad) return "bad payload";
+                if (!RectOk(g.Hit) || !RectOk(g.MaskBox) || !FloatOk(g.Cx, false) || !FloatOk(g.Cy, false) || !FloatOk(g.Hx, true) || !FloatOk(g.Hy, true) || !FloatOk(g.Rad, true)) return "a button value is out of range";
+                if (maskLen != 0)
+                {
+                    if ((long)maskLen != (long)g.MaskBox.Width * g.MaskBox.Height) return "a mask does not fit its box";
+                    g.Mask = r.Bytes((int)maskLen);
+                    if (r.Bad) return "bad payload";
+                }
+                a[i] = g;
+            }
+            buttons = a;
+            return null;
         }
 
         // The channel's retained spec with the latest props (size, place, look, profile, hover, motion).
@@ -609,6 +731,128 @@ namespace LGEngine
             return w.ToArray();
         }
 
+        // A Hello that carries the client's protocol minor (protocol 1.1).
+        public static byte[] HelloPayload(string name, int minor)
+        {
+            PayloadWriter w = new PayloadWriter();
+            w.U16(1);
+            w.U16(1);
+            w.Str(name);
+            w.U16(minor);
+            return w.ToArray();
+        }
+
+        // The host's minor in a HelloAck (-1: the ack carried none, a v1 host or a Hello without a minor).
+        public static int AckMinor(byte[] buf, int n)
+        {
+            if (ReplyType(buf, n) != Msg.HelloAck) return -1;
+            PayloadReader r = new PayloadReader(buf, GlassFrame.HeaderSize, n - GlassFrame.HeaderSize);
+            r.U16();
+            r.Str(256);
+            if (r.Remaining < 2) return -1;
+            int m = r.U16();
+            return r.Bad ? -1 : m;
+        }
+
+        public const int TypeSetMotionEx = Msg.SetMotionEx, TypeSetSlosh = Msg.SetSlosh, TypeKick = Msg.Kick, TypeSetButtons = Msg.SetButtons, TypeSetPointerArea = Msg.SetPointerArea,
+            TypeSetUpdates = Msg.SetUpdates, TypeSetBusy = Msg.SetBusy, TypeCut = Msg.Cut, TypeLightMoved = Msg.LightMoved;
+
+        public static byte[] SetMotionExPayload(uint surface, int zoom, int liquid, int bounce, int travel, int indicator)
+        {
+            PayloadWriter w = new PayloadWriter();
+            w.U32(surface);
+            w.I32(zoom);
+            w.I32(liquid);
+            w.I32(bounce);
+            w.I32(travel);
+            w.I32(indicator);
+            return w.ToArray();
+        }
+
+        public static byte[] SetSloshPayload(uint surface, int style, int amount)
+        {
+            PayloadWriter w = new PayloadWriter();
+            w.U32(surface);
+            w.I32(style);
+            w.I32(amount);
+            return w.ToArray();
+        }
+
+        public static byte[] KickPayload(uint surface, float push)
+        {
+            PayloadWriter w = new PayloadWriter();
+            w.U32(surface);
+            w.F32(push);
+            return w.ToArray();
+        }
+
+        // count buttons (hit boxes side by side), the first with a mask when withMask.
+        public static byte[] SetButtonsPayload(uint surface, bool carry, int count, bool withMask)
+        {
+            GlassButton[] b = new GlassButton[count];
+            for (int i = 0; i < count; i++)
+            {
+                b[i] = new GlassButton();
+                b[i].Hit = new Rectangle(10 + i * 30, 10, 28, 20);
+                b[i].Cx = 24f + i * 30;
+                b[i].Cy = 20f;
+                b[i].Hx = 14f;
+                b[i].Hy = 10f;
+                b[i].Rad = 8f;
+                b[i].Style = 1 + i;
+                b[i].Mark = 2;
+                b[i].MaskBox = new Rectangle(10 + i * 30, 10, 4, 3);
+                if (withMask && i == 0) b[i].Mask = new byte[12];
+            }
+            return GlassWire.Buttons(surface, b, carry);
+        }
+
+        public static byte[] SetPointerAreaPayload(uint surface, int x, int y, int w, int h)
+        {
+            PayloadWriter pw = new PayloadWriter();
+            pw.U32(surface);
+            pw.I32(x);
+            pw.I32(y);
+            pw.I32(w);
+            pw.I32(h);
+            return pw.ToArray();
+        }
+
+        public static byte[] SetUpdatesPayload(uint surface, int fps, int adapt, int savePower)
+        {
+            PayloadWriter w = new PayloadWriter();
+            w.U32(surface);
+            w.I32(fps);
+            w.U8(adapt);
+            w.U8(savePower);
+            return w.ToArray();
+        }
+
+        public static byte[] SetBusyPayload(uint surface, int busy)
+        {
+            PayloadWriter w = new PayloadWriter();
+            w.U32(surface);
+            w.U8(busy);
+            return w.ToArray();
+        }
+
+        public static byte[] CutPayload(uint surface)
+        {
+            PayloadWriter w = new PayloadWriter();
+            w.U32(surface);
+            return w.ToArray();
+        }
+
+        // The light in a LightMoved frame (NaN: not one).
+        public static float LightOf(byte[] buf, int n)
+        {
+            if (ReplyType(buf, n) != Msg.LightMoved) return float.NaN;
+            PayloadReader r = new PayloadReader(buf, GlassFrame.HeaderSize, n - GlassFrame.HeaderSize);
+            r.U32();
+            float v = r.F32();
+            return r.Bad ? float.NaN : v;
+        }
+
         public static byte[] CreatePayload(uint cookie, string label, int width, int height, string profile)
         {
             GlassSpec s = new GlassSpec();
@@ -644,13 +888,16 @@ namespace LGEngine
             return new GlassLook(seed % 101, (seed * 7) % 101, (seed * 3) % 101, (seed * 5) % 101, (seed * 11) % 101, seed % 29, seed % 151, (seed * 13) % 101);
         }
 
-        public static byte[] ResizePayload(uint surface, int width, int height)
+        public static byte[] ResizePayload(uint surface, int width, int height) { return ResizePayload(surface, width, height, 0); }
+
+        // flags: bit0 = flow (honoured by a host speaking protocol 1.1 to a client that said so).
+        public static byte[] ResizePayload(uint surface, int width, int height, uint flags)
         {
             PayloadWriter w = new PayloadWriter();
             w.U32(surface);
             w.I32(width);
             w.I32(height);
-            w.U32(0);
+            w.U32(flags);
             return w.ToArray();
         }
 

@@ -47,6 +47,7 @@ namespace LGEngine
         uint nextSeq, nextCookie;
         volatile bool disposed, connected, everConnected;
         bool helloSeen;   // (the I/O thread's)
+        volatile int hostMinor = -1;   // the host's protocol minor: -1 until the HelloAck, then its trailing u16 (0 when it had none: a v1 host)
         volatile bool busyEver;   // (sticky: the constructor's wait)
         volatile bool busySeen;   // the host answered the Hello with Error "busy" (every slot taken): retry soon, never offline for good
         bool lostRaised;   // (the I/O thread's) Lost was raised for this connection
@@ -90,6 +91,7 @@ namespace LGEngine
         public string Name { get { return "host pipe"; } }
         public bool Connected { get { return connected; } }
         public bool EverConnected { get { return everConnected; } }
+        internal int HostMinor { get { return hostMinor; } }
 
         // A client that dies without a word (test): the pipe just closes and the I/O thread ends; nothing is told to the host, the
         // sections are let go. A Dispose afterwards only cleans up.
@@ -111,14 +113,14 @@ namespace LGEngine
         long nextStartAt;
         static readonly Random jitter = new Random();
 
-        // The wait after `fails` failed starts in a row (0 while fewer than 3).
+        // The wait after `fails` failed starts in a row (0 while fewer than 3; never more than 60 s, jitter included).
         internal static int StartDelayMs(int fails, Random rng)
         {
             if (fails < 3) return 0;
             int b = Math.Min(60000, 4000 << Math.Min(fails - 3, 4));
             double j;
             lock (rng) j = rng.NextDouble() * 0.25;
-            return (int)(b + b * j);
+            return Math.Min(60000, (int)(b + b * j));
         }
 
         void NoteStartFailed()
@@ -301,12 +303,14 @@ namespace LGEngine
             }
             helloSeen = false;
             lostRaised = false;
+            hostMinor = -1;
             try
             {
                 PayloadWriter hw = new PayloadWriter();
                 hw.U16(1);
                 hw.U16(1);
                 hw.Str("LGEngine client " + Process.GetCurrentProcess().Id);
+                hw.U16(GlassFrame.Minor);   // (protocol 1.1: our minor; a v1 host ignores the trailing bytes)
                 uint s;
                 Send(Msg.Hello, hw.ToArray(), null, out s);
                 byte[] buf = new byte[GlassFrame.MaxFrame];
@@ -358,6 +362,7 @@ namespace LGEngine
         void ConnectionLost()
         {
             restartPending = false;
+            hostMinor = -1;   // (unknown again until the next HelloAck)
             PipeChannel[] all;
             StatsWait[] waits;
             EventWaitHandle oldWake;
@@ -394,6 +399,9 @@ namespace LGEngine
                     {
                         int chosen = r.U16();
                         if (r.Bad || chosen != GlassFrame.Version) { PipeNative.Shut(pipe); return; }
+                        r.Str(256);   // (the host's name; then, from a 1.1 host, its minor)
+                        int minor = !r.Bad && r.Remaining >= 2 ? r.U16() : 0;
+                        hostMinor = Math.Max(0, minor);
                         EventWaitHandle ev;
                         try { ev = EventWaitHandle.OpenExisting(wakeName, EventWaitHandleRights.Modify | EventWaitHandleRights.Synchronize); }
                         catch (Exception) { PipeNative.Shut(pipe); return; }
@@ -496,6 +504,17 @@ namespace LGEngine
                             string text = r.Str(1024);
                             if (!r.Bad) ch.Events.Failed(code, text);
                         }
+                        break;
+                    }
+                case Msg.LightMoved:   // (protocol 1.1, only from a host that said it speaks it)
+                    {
+                        uint id = r.U32();
+                        float light = r.F32();
+                        PipeChannel ch;
+                        lock (gate) bySurface.TryGetValue(id, out ch);
+                        IGlassLightEvents sink = ch == null ? null : ch.Events as IGlassLightEvents;
+                        if (sink == null || r.Bad || float.IsNaN(light) || float.IsInfinity(light)) return;
+                        sink.LightMoved(Math.Max(0f, Math.Min(1f, light)));
                         break;
                     }
             }
@@ -698,6 +717,12 @@ namespace LGEngine
         Timer retryTimer;
         int writtenVersion = -1, lastContentVer = -1, sentLookVer;
         int sentSizeVer = -1, rejectedSizeVer = -1;   // the SizeVer of the Resize in flight / of the last one the host refused (not asked again)
+        // Protocol 1.1: what the host holds of the extras (a new host surface starts at these values; a Create resets them: see FreshExtras)
+        int sentFlowVer;
+        int sMotionZoom = -1, sMotionLiquid = -1, sMotionBounce = -1, sMotionTravel = -1, sOsdStyle = -1;
+        int sSloshStyle, sSloshAmount, sKickVer, sButtonsVer, sCutVer, sFps = -1, sAdapt = -1, sSavePower = -1;
+        bool sBusy, sHasPointer;
+        Rectangle sPointer;
         // the stats cache
         int cacheAt, cachedFrames;
         bool haveCache;
@@ -721,8 +746,28 @@ namespace LGEngine
                 createSent = true;
                 SurfaceProps p = state.Props;
                 sentLookVer = p.LookVer;
+                sentFlowVer = p.FlowVer;   // (the Create carries the size as it is: no flow)
                 return GlassWire.Create(Cookie, spec, p);
             }
+        }
+
+        // The host's protocol minor (-1: not known yet). 0 = a v1 host: the in-process extras are not available.
+        public int HostMinor { get { return owner.HostMinor; } }
+
+        // (gate held) A host surface was just created (first time, or again after a host restart): it holds the defaults, so every extra
+        // is sent again. A kick and a cut are events, not state: they are not replayed.
+        void FreshExtras(SurfaceProps p)
+        {
+            sMotionZoom = sMotionLiquid = sMotionBounce = sMotionTravel = sOsdStyle = -1;
+            sSloshStyle = sSloshAmount = 0;
+            sButtonsVer = 0;
+            sFps = sAdapt = sSavePower = -1;
+            sBusy = false;
+            sHasPointer = false;
+            sPointer = Rectangle.Empty;
+            sKickVer = p.KickVer;
+            sCutVer = p.CutVer;
+            state.TakeKick();
         }
 
         // True when this surface needs nothing more from a reconnect: it is created on the host (ready), or it is closed or failed.
@@ -748,6 +793,7 @@ namespace LGEngine
                 catch (Exception ex) { fail = ex.Message; }
                 if (fail == null)
                 {
+                    if (!ready) FreshExtras(state.Props);   // (the answer to a Create; an answer to a Resize leaves the host's extras as they are)
                     if (section != null) section.Dispose();
                     section = s;
                     surfaceId = id;
@@ -816,10 +862,12 @@ namespace LGEngine
                     w.U32(surfaceId);
                     w.I32(p.Size.Width);
                     w.I32(p.Size.Height);
-                    w.U32(Cookie);
+                    w.U32(owner.HostMinor >= 1 && p.FlowVer != sentFlowVer ? 1u : 0u);   // (flags: bit0 = flow, protocol 1.1)
+                    sentFlowVer = p.FlowVer;
                     owner.Send(Msg.Resize, w.ToArray(), this, out seq);
                 }
             }
+            else if (!resizePending) sentFlowVer = p.FlowVer;   // (the size is back at the section's: a flow asked for before is dropped, it is not for a later resize)
             if (p.LookVer != sentLookVer)
             {
                 if (owner.TakeToken())
@@ -839,12 +887,14 @@ namespace LGEngine
                     else retryTimer.Change(10, Timeout.Infinite);
                 }
             }
+            if (owner.HostMinor >= 1) SendCut(p);   // (before the state block, see SendCut)
             if (p.Version != writtenVersion)
             {
                 section.WriteState(p);
                 writtenVersion = p.Version;
                 wrote = true;
             }
+            if (owner.HostMinor >= 1) SendExtras(p);
             int cw, ch, ver;
             Rectangle dirty;
             int[] px = state.Contents.Take(out cw, out ch, out ver, out dirty);
@@ -861,6 +911,102 @@ namespace LGEngine
                 wrote = true;
             }
             return wrote;
+        }
+
+        // (gate held) Protocol 1.1: sends what changed of the extras since the host last heard (a diff against what was sent).
+        void SendExtras(SurfaceProps p)
+        {
+            uint seq;
+            if (p.MotionZoom != sMotionZoom || p.MotionLiquid != sMotionLiquid || p.MotionBounce != sMotionBounce || p.MotionTravel != sMotionTravel || p.OsdStyle != sOsdStyle)
+            {
+                sMotionZoom = p.MotionZoom;
+                sMotionLiquid = p.MotionLiquid;
+                sMotionBounce = p.MotionBounce;
+                sMotionTravel = p.MotionTravel;
+                sOsdStyle = p.OsdStyle;
+                PayloadWriter w = new PayloadWriter();
+                w.U32(surfaceId);
+                w.I32(sMotionZoom);
+                w.I32(sMotionLiquid);
+                w.I32(sMotionBounce);
+                w.I32(sMotionTravel);
+                w.I32(sOsdStyle);
+                owner.Send(Msg.SetMotionEx, w.ToArray(), null, out seq);
+            }
+            if (p.SloshStyle != sSloshStyle || p.SloshAmount != sSloshAmount)
+            {
+                sSloshStyle = p.SloshStyle;
+                sSloshAmount = p.SloshAmount;
+                PayloadWriter w = new PayloadWriter();
+                w.U32(surfaceId);
+                w.I32(sSloshStyle);
+                w.I32(sSloshAmount);
+                owner.Send(Msg.SetSlosh, w.ToArray(), null, out seq);
+            }
+            if (p.KickVer != sKickVer)
+            {
+                sKickVer = p.KickVer;
+                float push = state.TakeKick();
+                // (a Kick is limited to |push| <= 8 on the wire: a larger sum goes out as several frames, so it sums up as in process)
+                for (int k = 0; k < 64 && push != 0f && !float.IsNaN(push) && !float.IsInfinity(push); k++)
+                {
+                    float part = Math.Max(-8f, Math.Min(8f, push));
+                    PayloadWriter w = new PayloadWriter();
+                    w.U32(surfaceId);
+                    w.F32(part);
+                    owner.Send(Msg.Kick, w.ToArray(), null, out seq);
+                    push -= part;
+                }
+            }
+            if (p.ButtonsVer != sButtonsVer)
+            {
+                sButtonsVer = p.ButtonsVer;
+                owner.Send(Msg.SetButtons, GlassWire.Buttons(surfaceId, p.Buttons, p.ButtonsCarry), null, out seq);
+            }
+            if (p.HasPointer != sHasPointer || p.Pointer != sPointer)
+            {
+                sHasPointer = p.HasPointer;
+                sPointer = p.Pointer;
+                Rectangle a = p.HasPointer ? p.Pointer : Rectangle.Empty;
+                PayloadWriter w = new PayloadWriter();
+                w.U32(surfaceId);
+                w.I32(Math.Max(-100000, Math.Min(100000, a.X)));
+                w.I32(Math.Max(-100000, Math.Min(100000, a.Y)));
+                w.I32(a.Width);
+                w.I32(a.Height);
+                owner.Send(Msg.SetPointerArea, w.ToArray(), null, out seq);
+            }
+            if (p.Fps >= 0 && p.Adapt >= 0 && p.SavePower >= 0 && (p.Fps != sFps || p.Adapt != sAdapt || p.SavePower != sSavePower))
+            {
+                sFps = p.Fps;
+                sAdapt = p.Adapt;
+                sSavePower = p.SavePower;
+                PayloadWriter w = new PayloadWriter();
+                w.U32(surfaceId);
+                w.I32(sFps);
+                w.U8(sAdapt);
+                w.U8(sSavePower);
+                owner.Send(Msg.SetUpdates, w.ToArray(), null, out seq);
+            }
+            if (p.Busy != sBusy)
+            {
+                sBusy = p.Busy;
+                PayloadWriter w = new PayloadWriter();
+                w.U32(surfaceId);
+                w.U8(sBusy ? 1 : 0);
+                owner.Send(Msg.SetBusy, w.ToArray(), null, out seq);
+            }
+        }
+
+        // (gate held) A cut goes out BEFORE the state block that says "hidden" is published, so the host never starts an animated hide.
+        void SendCut(SurfaceProps p)
+        {
+            if (p.CutVer == sCutVer) return;
+            sCutVer = p.CutVer;
+            uint seq;
+            PayloadWriter w = new PayloadWriter();
+            w.U32(surfaceId);
+            owner.Send(Msg.Cut, w.ToArray(), null, out seq);
         }
 
         void RetryTick(object state)
