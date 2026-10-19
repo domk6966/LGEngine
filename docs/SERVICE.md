@@ -144,6 +144,10 @@ the host supports the previous minor. The mutex, pipe and section names carry th
 running host asks the old host to exit when idle (`ShutdownWhenIdle`) and starts its own copy from its own folder; the host executable is
 copied to `%LOCALAPPDATA%\LGEngine\<version>\` on first use so an app's update never replaces a running host.
 
+Protocol 1.1 (minor, additive): Hello may end with a u16 client minor and HelloAck then ends with the host's; the session minor is the
+lower of the two. Messages 10..17 (the in-process extras) and the event 0x24 LightMoved exist only in a 1.1 session (else Error
+Unsupported); Resize's trailing u32 is flags (bit 0 flow). See CLIENTS.md for the table.
+
 ## 9. Migration: no flag day
 
 1. Phase 0, today: the engine runs in the app's process (GlassOverlay / SearchGlass own their windows and timing).

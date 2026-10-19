@@ -106,10 +106,11 @@ frame (latest wins; there is no queue to fill).
 | `SetDeform(deform)` | your own bend (zoom, lean, swell) instead of the engine's while it isn't `Deform.None` |
 | `Show()` / `Hide()` | arrive / leave with the motion above |
 
-### In-process extras (`LGEngine.dll`, modes `InProcess` and `UiThread`)
+### In-process extras (`LGEngine.dll`, modes `InProcess` and `UiThread`; over the host from protocol 1.1)
 
-Liquid Glass's own notifications and volume/brightness indicator use these. Over the host they throw
-`NotSupportedException`.
+Liquid Glass's own notifications and volume/brightness indicator use these. A host that speaks protocol 1.1 (the HelloAck
+carries its minor) takes all of them except `BeforeRender` over the pipe; the client re-sends them after a host restart. Over an
+older (1.0) host they throw `NotSupportedException`. `BeforeRender` is always in-process only.
 
 | call | what it does |
 |---|---|
@@ -133,6 +134,28 @@ and `PeekOnExit` (keep reading the background during the leaving motion).
 Other events: `Hidden`, `AppearanceChanged` (the glass turned light or dark: switch your text colour), and
 `RequestRejected` (host mode only: the host refused a request without killing the surface, e.g. a `SetSize` over your
 memory quota; the surface stays at its last size, so set a size that fits before the next `SetContents`).
+
+### Wire level, protocol 1.1 (for clients that are not .NET)
+
+Add a trailing u16 minor (1) to Hello; a host that speaks 1.1 then appends its own u16 minor to HelloAck. Without it the session
+is 1.0 and these types get Error Unsupported. All integers little-endian; every message starts with the u32 surface id.
+
+| type | message | payload after the id |
+|---|---|---|
+| 10 | SetMotionEx | i32 zoom, liquid, bounce, travel, indicator (-1 = default) |
+| 11 | SetSlosh | i32 style (0..3), i32 amount (0..100) |
+| 12 | Kick | f32 push (finite, \|push\| <= 8) |
+| 13 | SetButtons | u8 carry, u16 count (<= 32), per button: hit rect, f32 cx, cy, hx, hy, rad, i32 style, mark, mask rect, u32 mask length + bytes |
+| 14 | SetPointerArea | i32 x, y, w, h (w or h <= 0 clears) |
+| 15 | SetUpdates | i32 fps (0..60), u8 adapt, u8 savePower |
+| 16 | SetBusy | u8 0 or 1 |
+| 17 | Cut | none: hide at once, no leaving motion |
+| 0x24 | LightMoved (host to client) | f32 light 0..1; sent to 1.1 sessions only |
+
+Resize's trailing u32 is now flags: bit 0 = flow (1.1 sessions); bits 1-31 are ignored, but a 1.1 client must send 0 in them.
+Once your Hello carries a minor, do not send the old cookie there (a 1.0 client's cookie is read as flags by a 1.1 host only
+when the session is 1.1). A value out of range in messages 10..16 gets Error BadPayload, an unknown id NoSurface.
+After each CreateAck the client sends its extras again.
 
 ## Limits and errors
 
