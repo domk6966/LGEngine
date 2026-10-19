@@ -1,6 +1,6 @@
-﻿# LGEngine
+# LGEngine
 
-Version 2.7.12.0 - protocol 1.1.
+Version 1.0.0 — initial release.
 
 The rendering engine behind Liquid Glass: Apple-style "liquid glass" surfaces for Windows (notifications, the
 volume/brightness indicator, a search box, a dock), drawn over the live desktop.
@@ -52,4 +52,4 @@ the small library other apps reference to use the host.
 
 ## License
 
-Not chosen yet.
+MIT: see `LICENSE`. Copyright (c) 2026 DK (domk6966).

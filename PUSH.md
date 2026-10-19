@@ -1,4 +1,4 @@
-﻿# For the assistant pushing this to GitHub
+# For the assistant pushing this to GitHub
 
 - This folder (`github\LGEngine`) IS the repository root. Push everything in it, and nothing from outside it.
 - Never add binaries (exe, dll, pdb), pictures, logs or ini files; `.gitignore` already keeps them out.
