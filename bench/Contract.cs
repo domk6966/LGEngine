@@ -563,6 +563,281 @@ namespace LGBench
             }
         }
 
+        // ---- protocol 1.1 (an additive minor): raw sessions with and without a minor, then a real client over the pipe ----
+
+        static bool PropsHas(GlassHostServer host, string label, string part)
+        {
+            string t = host.TestProps(label);
+            return t != null && t.IndexOf(part, StringComparison.Ordinal) >= 0;
+        }
+
+        static bool WaitProps(GlassHostServer host, string label, string part)
+        {
+            return Pump(2000, delegate { return PropsHas(host, label, part); });
+        }
+
+        static bool SameBytes(byte[] buf, int n, byte[] want)
+        {
+            if (n != want.Length) return false;
+            for (int i = 0; i < n; i++) if (buf[i] != want[i]) return false;
+            return true;
+        }
+
+        // The v1 HelloAck for a Hello with seq 1: version 1, then the name "LGEngine host"; withMinor appends the host's minor (u16 1).
+        static byte[] AckBytes(bool withMinor)
+        {
+            List<byte> pl = new List<byte>();
+            pl.AddRange(new byte[] { 1, 0, 13, 0 });
+            pl.AddRange(Encoding.ASCII.GetBytes("LGEngine host"));
+            if (withMinor) pl.AddRange(new byte[] { 1, 0 });
+            return GlassProtocolTest.Frame(GlassProtocolTest.TypeHelloAck, 1, pl.ToArray());
+        }
+
+        // A raw session (minor < 0: a Hello without one) with one surface; null if the host did not answer.
+        static NamedPipeClientStream RawSurface(GlassHostServer host, int minor, string label, int w, int h, byte[] buf, out uint id)
+        {
+            id = 0;
+            NamedPipeClientStream p = Raw(host);
+            byte[] hello = minor < 0 ? GlassProtocolTest.HelloPayload("LGBench raw") : GlassProtocolTest.HelloPayload("LGBench raw", minor);
+            RawSend(p, GlassProtocolTest.Frame(GlassProtocolTest.TypeHello, 1, hello));
+            int n = RawRead(p, buf, 2000);
+            if (n <= 0 || GlassProtocolTest.ReplyType(buf, n) != GlassProtocolTest.TypeHelloAck) { p.Dispose(); return null; }
+            RawSend(p, GlassProtocolTest.Frame(GlassProtocolTest.TypeCreate, 2, GlassProtocolTest.CreatePayload(1, label, w, h, "")));
+            n = RawRead(p, buf, 2000);
+            id = GlassProtocolTest.AckSurface(buf, n);
+            if (id == 0) { p.Dispose(); return null; }
+            return p;
+        }
+
+        // An Error with the given code for a request on a surface (the host throttles an Error per surface to one in 100 ms: waits first).
+        static bool ExpectErrorLater(NamedPipeClientStream p, int type, uint seq, byte[] payload, int code, byte[] buf)
+        {
+            Thread.Sleep(120);
+            RawSend(p, GlassProtocolTest.Frame(type, seq, payload));
+            int n = RawRead(p, buf, 2000);
+            bool ok = n > 0 && GlassProtocolTest.ReplyType(buf, n) == GlassProtocolTest.TypeError && BitConverter.ToInt32(buf, 16) == code;
+            return ok;
+        }
+
+        // True when the next frame from the host is the answer to a Stats (so that no event came before it).
+        static bool NothingBefore(NamedPipeClientStream p, uint id, uint seq, byte[] buf)
+        {
+            Thread.Sleep(150);
+            RawSend(p, GlassProtocolTest.Frame(GlassProtocolTest.TypeStats, seq, BitConverter.GetBytes(id)));
+            int n = RawRead(p, buf, 2000);
+            return n > 0 && GlassProtocolTest.ReplyType(buf, n) == GlassProtocolTest.TypeStatsReply;
+        }
+
+        static float NextLight(NamedPipeClientStream p, byte[] buf)
+        {
+            int n = RawRead(p, buf, 2000);
+            return n > 0 ? GlassProtocolTest.LightOf(buf, n) : float.NaN;
+        }
+
+        static void MinorChecks(GlassHostServer host)
+        {
+            byte[] buf = new byte[70000];
+            int n;
+            uint ghost = 424242;
+            int[] newTypes = new int[] { GlassProtocolTest.TypeSetMotionEx, GlassProtocolTest.TypeSetSlosh, GlassProtocolTest.TypeKick, GlassProtocolTest.TypeSetButtons,
+                GlassProtocolTest.TypeSetPointerArea, GlassProtocolTest.TypeSetUpdates, GlassProtocolTest.TypeSetBusy, GlassProtocolTest.TypeCut };
+
+            // a Hello without a minor (a v1 client): the HelloAck is the v1 one byte for byte; the new types are Unsupported
+            using (NamedPipeClientStream p = Raw(host))
+            {
+                RawSend(p, GlassProtocolTest.Frame(GlassProtocolTest.TypeHello, 1, GlassProtocolTest.HelloPayload("LGBench raw v1")));
+                n = RawRead(p, buf, 2000);
+                Check(SameBytes(buf, n, AckBytes(false)), "minor 0: a Hello without a minor gets the v1 HelloAck byte for byte (" + n + " bytes)");
+                Check(GlassProtocolTest.AckMinor(buf, n) == -1, "minor 0: the ack carries no minor");
+                Check(ExpectError(p, GlassProtocolTest.Frame(GlassProtocolTest.TypeSetMotionEx, 2, GlassProtocolTest.SetMotionExPayload(1, 1, 1, 1, 1, 1)), 4, buf), "minor 0: message 10 gets Error Unsupported");
+                bool all = true;
+                for (int i = 1; i < newTypes.Length; i++) all &= ExpectError(p, GlassProtocolTest.Frame(newTypes[i], (uint)(3 + i), GlassProtocolTest.CutPayload(1)), 4, buf);
+                Check(all, "minor 0: messages 11..17 get Error Unsupported too");
+            }
+            // a Hello with a minor: the ack carries the host's (and says so even to a client that says 0)
+            using (NamedPipeClientStream p = Raw(host))
+            {
+                RawSend(p, GlassProtocolTest.Frame(GlassProtocolTest.TypeHello, 1, GlassProtocolTest.HelloPayload("LGBench raw 1.1", 1)));
+                n = RawRead(p, buf, 2000);
+                Check(SameBytes(buf, n, AckBytes(true)) && GlassProtocolTest.AckMinor(buf, n) == 1, "minor 1: a Hello with a minor gets the v1 ack plus the host's minor (u16 1)");
+            }
+            using (NamedPipeClientStream p = Raw(host))
+            {
+                RawSend(p, GlassProtocolTest.Frame(GlassProtocolTest.TypeHello, 1, GlassProtocolTest.HelloPayload("LGBench raw 1.0", 0)));
+                n = RawRead(p, buf, 2000);
+                Check(GlassProtocolTest.AckMinor(buf, n) == 1, "minor 0 said: the ack still carries the host's minor");
+                Check(ExpectError(p, GlassProtocolTest.Frame(GlassProtocolTest.TypeCut, 2, GlassProtocolTest.CutPayload(1)), 4, buf), "minor 0 said: message 17 gets Error Unsupported");
+            }
+
+            // a 1.1 session: every message takes effect on the host's surface
+            string L = Title + " minor raw";
+            uint id;
+            NamedPipeClientStream q = RawSurface(host, 1, L, 200, 80, buf, out id);
+            Check(q != null, "minor 1: a surface was created");
+            if (q != null)
+            {
+                using (q)
+                {
+                    uint seq = 10;
+                    RawSend(q, GlassProtocolTest.Frame(GlassProtocolTest.TypeSetMotionEx, seq++, GlassProtocolTest.SetMotionExPayload(id, 10, 60, 45, 34, 2)));
+                    Check(WaitProps(host, L, "mz=10;ml=60;mb=45;mt=34;os=2;"), "minor 1: SetMotionEx reaches the host's props");
+                    RawSend(q, GlassProtocolTest.Frame(GlassProtocolTest.TypeSetUpdates, seq++, GlassProtocolTest.SetUpdatesPayload(id, 15, 1, 0)));
+                    Check(WaitProps(host, L, "fps=15;ad=1;sp=0;"), "minor 1: SetUpdates reaches the host's props");
+                    RawSend(q, GlassProtocolTest.Frame(GlassProtocolTest.TypeSetPointerArea, seq++, GlassProtocolTest.SetPointerAreaPayload(id, 5, 6, 70, 40)));
+                    Check(WaitProps(host, L, "hp=1;pa=5,6,70,40;"), "minor 1: SetPointerArea reaches the host's props");
+                    RawSend(q, GlassProtocolTest.Frame(GlassProtocolTest.TypeSetPointerArea, seq++, GlassProtocolTest.SetPointerAreaPayload(id, 0, 0, 0, 0)));
+                    Check(WaitProps(host, L, "hp=0;pa=0,0,0,0;"), "minor 1: an empty SetPointerArea clears it");
+                    RawSend(q, GlassProtocolTest.Frame(GlassProtocolTest.TypeSetBusy, seq++, GlassProtocolTest.SetBusyPayload(id, 1)));
+                    Check(WaitProps(host, L, "busy=1;"), "minor 1: SetBusy reaches the host's props");
+                    RawSend(q, GlassProtocolTest.Frame(GlassProtocolTest.TypeSetButtons, seq++, GlassProtocolTest.SetButtonsPayload(id, true, 2, true)));
+                    Check(WaitProps(host, L, "bv=1;bc=1;b=2/1,10,8,12;"), "minor 1: SetButtons (two buttons, a mask) reaches the host's props");
+                    RawSend(q, GlassProtocolTest.Frame(GlassProtocolTest.TypeSetButtons, seq++, GlassProtocolTest.SetButtonsPayload(id, false, 0, false)));
+                    Check(WaitProps(host, L, "bv=2;bc=0;b=;"), "minor 1: SetButtons with no buttons clears them");
+                    // the slosh, and a kick that counts only while it sloshes
+                    RawSend(q, GlassProtocolTest.Frame(GlassProtocolTest.TypeSetSlosh, seq++, GlassProtocolTest.SetSloshPayload(id, 0, 60)));
+                    RawSend(q, GlassProtocolTest.Frame(GlassProtocolTest.TypeKick, seq++, GlassProtocolTest.KickPayload(id, 4.4f)));
+                    Check(WaitProps(host, L, "ss=0;sa=60;kv=1;"), "minor 1: SetSlosh and Kick reach the host's props");
+                    RawSend(q, GlassProtocolTest.Frame(GlassProtocolTest.TypeSetSlosh, seq++, GlassProtocolTest.SetSloshPayload(id, 3, 60)));
+                    RawSend(q, GlassProtocolTest.Frame(GlassProtocolTest.TypeKick, seq++, GlassProtocolTest.KickPayload(id, 4.4f)));
+                    Check(WaitProps(host, L, "ss=3;") && NothingBefore(q, id, seq++, buf) && PropsHas(host, L, "kv=1;"), "minor 1: a Kick while the slosh style is none is ignored");
+                    RawSend(q, GlassProtocolTest.Frame(GlassProtocolTest.TypeCut, seq++, GlassProtocolTest.CutPayload(id)));
+                    Check(WaitProps(host, L, "cv=1;"), "minor 1: Cut reaches the host's props");
+                    // Resize with flow: the glass flows from the old width
+                    RawSend(q, GlassProtocolTest.Frame(GlassProtocolTest.TypeResize, seq++, GlassProtocolTest.ResizePayload(id, 220, 80, 1)));
+                    n = RawRead(q, buf, 2000);
+                    Check(n > 0 && GlassProtocolTest.ReplyType(buf, n) == GlassProtocolTest.TypeCreateAck && WaitProps(host, L, "fv=1;ff=0.909;w=220;"), "minor 1: Resize with the flow bit sets the flow (200 -> 220)");
+                    RawSend(q, GlassProtocolTest.Frame(GlassProtocolTest.TypeResize, seq++, GlassProtocolTest.ResizePayload(id, 240, 80, 0)));
+                    n = RawRead(q, buf, 2000);
+                    Check(n > 0 && GlassProtocolTest.ReplyType(buf, n) == GlassProtocolTest.TypeCreateAck && WaitProps(host, L, "fv=1;ff=0.909;w=240;"), "minor 1: Resize without the bit leaves the flow alone");
+                    // what the host refuses
+                    Check(ExpectErrorLater(q, GlassProtocolTest.TypeSetMotionEx, seq++, GlassProtocolTest.SetMotionExPayload(id, 51, 0, 0, 0, 0), 5, buf), "minor 1: a zoom of 51 gets Error BadPayload");
+                    Check(ExpectErrorLater(q, GlassProtocolTest.TypeSetSlosh, seq++, GlassProtocolTest.SetSloshPayload(id, 4, 0), 5, buf), "minor 1: a slosh style of 4 gets Error BadPayload");
+                    Check(ExpectErrorLater(q, GlassProtocolTest.TypeKick, seq++, GlassProtocolTest.KickPayload(id, float.NaN), 5, buf), "minor 1: a NaN kick gets Error BadPayload");
+                    Check(ExpectErrorLater(q, GlassProtocolTest.TypeKick, seq++, GlassProtocolTest.KickPayload(id, 9f), 5, buf), "minor 1: a kick over 8 gets Error BadPayload");
+                    byte[] b33 = GlassProtocolTest.SetButtonsPayload(id, false, 1, false);   // (the builder holds to 32: the count is set by hand)
+                    b33[5] = 33;
+                    b33[6] = 0;
+                    Check(ExpectErrorLater(q, GlassProtocolTest.TypeSetButtons, seq++, b33, 5, buf), "minor 1: 33 buttons get Error BadPayload");
+                    Check(ExpectErrorLater(q, GlassProtocolTest.TypeSetUpdates, seq++, GlassProtocolTest.SetUpdatesPayload(id, 61, 0, 0), 5, buf), "minor 1: 61 fps gets Error BadPayload");
+                    Check(ExpectErrorLater(q, GlassProtocolTest.TypeSetBusy, seq++, GlassProtocolTest.SetBusyPayload(id, 2), 5, buf), "minor 1: a busy of 2 gets Error BadPayload");
+                    Check(ExpectErrorLater(q, GlassProtocolTest.TypeSetPointerArea, seq++, GlassProtocolTest.SetPointerAreaPayload(id, 100001, 0, 1, 1), 5, buf), "minor 1: a pointer x of 100001 gets Error BadPayload");
+                    Check(ExpectErrorLater(q, GlassProtocolTest.TypeSetBusy, seq++, new byte[2], 5, buf), "minor 1: a short payload gets Error BadPayload");
+                    Check(ExpectErrorLater(q, GlassProtocolTest.TypeCut, seq++, GlassProtocolTest.CutPayload(ghost), 8, buf), "minor 1: Cut of an unknown surface gets Error NoSurface");
+                    // the light: first value, then only 0.02 steps, and an exact 0 or 1 once
+                    Check(host.TestLight(L, 0.5f) && NextLight(q, buf) == 0.5f, "light: the first value is sent to a 1.1 session");
+                    host.TestLight(L, 0.51f);
+                    Check(NothingBefore(q, id, seq++, buf), "light: a step under 0.02 is not sent");
+                    host.TestLight(L, 0.6f);
+                    Check(NextLight(q, buf) == 0.6f, "light: a step of 0.1 is sent");
+                    host.TestLight(L, 1f);
+                    Check(NextLight(q, buf) == 1f, "light: an exact 1 is sent");
+                    host.TestLight(L, 1f);
+                    Check(NothingBefore(q, id, seq++, buf), "light: an exact 1 again is not");
+                    host.TestLight(L, 0f);
+                    Check(NextLight(q, buf) == 0f, "light: an exact 0 is sent");
+                }
+            }
+
+            // a minor-0 session: the light is not sent, and the flow bit is ignored
+            string L0 = Title + " minor 0 raw";
+            uint id0;
+            NamedPipeClientStream q0 = RawSurface(host, -1, L0, 200, 80, buf, out id0);
+            Check(q0 != null, "minor 0: a surface was created");
+            if (q0 != null)
+            {
+                using (q0)
+                {
+                    host.TestLight(L0, 0.5f);
+                    Check(NothingBefore(q0, id0, 10, buf), "minor 0: no light event is sent");
+                    RawSend(q0, GlassProtocolTest.Frame(GlassProtocolTest.TypeResize, 11, GlassProtocolTest.ResizePayload(id0, 220, 80, 1)));
+                    n = RawRead(q0, buf, 2000);
+                    Check(n > 0 && GlassProtocolTest.ReplyType(buf, n) == GlassProtocolTest.TypeCreateAck && WaitProps(host, L0, "w=220;") && PropsHas(host, L0, "fv=0;"), "minor 0: the flow bit of a Resize is ignored");
+                }
+            }
+        }
+
+        // A real client over the pipe: every call works (no NotSupportedException), the host's surface holds the result, the light arrives.
+        static void MinorClientChecks(GlassHostServer host, string suffix)
+        {
+            GlassService svc = GlassService.Connect(new GlassConnectOptions { Mode = GlassMode.Host, HostSuffix = suffix });
+            try
+            {
+                GlassSpec spec = Spec(Title + " minor client");
+                string L = spec.Label;
+                int w = spec.Size.Width, h = spec.Size.Height;
+                GlassSurface s = svc.Create(spec);
+                Count shown = new Count(), lights = new Count(), failed = new Count();
+                float lastLight = -1f;
+                s.Shown += delegate { shown.Inc(); };
+                s.Failed += delegate(object o, GlassFailedEventArgs e) { failed.Inc(); Program.Say("contract: minor client Failed {0} {1}", e.Code, e.Text); };
+                s.LightMoved += delegate(float v) { lastLight = v; lights.Inc(); };
+                s.SetContents(Picture(w, h, 40), w, h, Rectangle.Empty);
+                s.Show();
+                Check(Pump(3000, delegate { return shown.Get() > 0; }), "minor client: Shown");
+                string threw = null;
+                GlassButton[] two = new GlassButton[2];
+                for (int i = 0; i < 2; i++)
+                {
+                    two[i] = new GlassButton();
+                    two[i].Hit = new Rectangle(4 + i * 100, 4, 90, 40);
+                    two[i].Rad = 6f;
+                    two[i].Style = 3;
+                    two[i].MaskBox = new Rectangle(4 + i * 100, 4, 300, 200);
+                    two[i].Mask = new byte[300 * 200];   // (two of these are over 64 KB: sent without the masks)
+                }
+                try
+                {
+                    s.SetMotion(4, 380, 230, 10, 60, 45, 34, 2);
+                    s.SetUpdates(15, true, false);
+                    s.SetPointerArea(new Rectangle(0, 0, 10, 10));
+                    s.SetSlosh(0, 60);
+                    s.Kick(1);
+                    s.SetBusy(true);
+                    s.SetButtons(two, false);
+                }
+                catch (Exception ex) { threw = ex.GetType().Name + " " + ex.Message; }
+                Check(threw == null, "minor client: the step-6 calls work over a 1.1 host (" + threw + ")");
+                Check(WaitProps(host, L, "mz=10;ml=60;mb=45;mt=34;os=2;"), "minor client: SetMotion(8) reaches the host");
+                Check(WaitProps(host, L, "fps=15;ad=1;sp=0;"), "minor client: SetUpdates reaches the host");
+                Check(WaitProps(host, L, "hp=1;pa=0,0,10,10;"), "minor client: SetPointerArea reaches the host");
+                Check(WaitProps(host, L, "ss=0;sa=60;kv=1;"), "minor client: SetSlosh and Kick reach the host");
+                Check(WaitProps(host, L, "busy=1;"), "minor client: SetBusy reaches the host");
+                Check(WaitProps(host, L, "bv=1;bc=0;b=2/3,4,6,0;"), "minor client: SetButtons that do not fit a frame arrive without masks");
+                // the glass flows to a new width (360 -> 300: 1.2, held to 1.16)
+                try { s.SetSize(new Size(300, h), Picture(300, h, 40), true); }
+                catch (Exception ex) { threw = ex.GetType().Name; }
+                Check(WaitProps(host, L, "fv=1;ff=1.16;w=300;"), "minor client: SetSize with flow reaches the host");
+                // a burst of extras while a Resize is in flight does not lose it (the extras take no place in the pending ring)
+                try
+                {
+                    s.SetSize(new Size(320, h), Picture(320, h, 40), false);
+                    for (int i = 0; i < 400; i++)
+                    {
+                        s.Kick(i % 2 == 0 ? 1 : -1);
+                        s.SetPointerArea(new Rectangle(i % 50, 0, 10, 10));
+                    }
+                }
+                catch (Exception ex) { threw = ex.GetType().Name; }
+                Check(WaitProps(host, L, "w=320;") && PropsHas(host, L, "fv=1;"), "minor client: a burst of Kicks and pointer areas during a Resize still resolves it");
+                // a cut: gone at once
+                try { s.Hide(false); }
+                catch (Exception ex) { threw = ex.GetType().Name; }
+                Check(WaitProps(host, L, "cv=1;want=0;"), "minor client: Hide(false) is a cut on the host");
+                s.Show();
+                Check(WaitProps(host, L, "want=1;"), "minor client: a Show after the cut is shown again");
+                // the light
+                host.TestLight(L, 0.7f);
+                Check(Pump(2000, delegate { return lights.Get() > 0 && lastLight == 0.7f && s.Light == 0.7f; }), "minor client: LightMoved arrives from the host (" + lastLight + ")");
+                bool noBefore = false;
+                try { s.BeforeRender += delegate(float v) { }; }
+                catch (NotSupportedException) { noBefore = true; }
+                Check(noBefore, "minor client: BeforeRender still throws NotSupportedException over the pipe");
+                Check(threw == null && !s.HasFailed && failed.Get() == 0, "minor client: nothing threw, the surface did not fail (" + threw + ")");
+                s.Dispose();
+            }
+            finally { svc.Dispose(); }
+        }
+
         static bool SameLook(GlassLook a, GlassLook b)
         {
             return a.Dark == b.Dark && a.Blur == b.Blur && a.Refraction == b.Refraction && a.Rim == b.Rim && a.Shadow == b.Shadow && a.Round == b.Round && a.Intensity == b.Intensity && a.Elevation == b.Elevation;
@@ -982,6 +1257,9 @@ namespace LGBench
                 s.SetContents(Picture(spec.Size.Width, spec.Size.Height, 40), spec.Size.Width, spec.Size.Height, Rectangle.Empty);
                 s.Show();
                 Check(Pump(3000, delegate { return shown.Get() > 0; }), "restart: Shown before the host stops");
+                s.SetSlosh(1, 40);   // (protocol 1.1 extras: the new host surface gets them again)
+                s.SetBusy(true);
+                Check(WaitProps(host, spec.Label, "ss=1;sa=40;") && WaitProps(host, spec.Label, "busy=1;"), "restart: the extras reached the first host");
                 host.Stop();
                 Check(Pump(5000, delegate { return lost.Get() > 0; }), "restart: Lost raised when the host stops");
                 Check(!svc.HostConnected && !s.HasFailed, "restart: the service waits, the surface has not failed");
@@ -992,6 +1270,7 @@ namespace LGBench
                 int s1 = shown.Get();
                 Check(Pump(5000, delegate { return shown.Get() > s1; }), "restart: the surface is shown again by the new host");
                 Check(svc.HostConnected && !s.HasFailed && failed.Get() == 0, "restart: connected, no failure");
+                Check(WaitProps(host, spec.Label, "ss=1;sa=40;") && PropsHas(host, spec.Label, "busy=1;"), "restart: the extras were sent again to the new host surface");
                 s.Dispose();
             }
             finally { svc.Dispose(); }
@@ -1248,6 +1527,8 @@ namespace LGBench
                 RunMode(GlassMode.Host, "loopback pipe", "host pipe", suffix);
                 ThreadChecks(suffix);
                 MalformedChecks(host);
+                MinorChecks(host);
+                MinorClientChecks(host, suffix);
                 HelloTimeoutCheck(host);
                 CapCheck(host);
                 BusyCheck();

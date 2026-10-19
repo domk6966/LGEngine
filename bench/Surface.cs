@@ -914,7 +914,14 @@ namespace LGBench
             catch (Exception ex) { Note(Api, false, 255, what + " threw " + ex.GetType().Name); }
         }
 
-        // Over the pipe the new setters are not supported (they throw NotSupportedException); in process they do not.
+        static void Works(string what, Action call)
+        {
+            try { call(); Note(Api, true, 0, what + " works over the pipe"); }
+            catch (Exception ex) { Note(Api, false, 255, what + " threw over the pipe: " + ex.GetType().Name); }
+        }
+
+        // A minor-1 host takes the new setters over the pipe (protocol 1.1); BeforeRender stays in process only.
+        // (A known minor-0 host makes them throw NotSupportedException; that path needs a fake host and is not run here.)
         static void LoopbackChecks()
         {
             string suffix = "sb" + System.Diagnostics.Process.GetCurrentProcess().Id;
@@ -927,16 +934,16 @@ namespace LGBench
                 GlassSpec spec = Contract.Spec("LG surface bench pipe");
                 GlassSurface s = piped.Create(spec);
                 int[] px = new int[spec.Size.Width * spec.Size.Height];
-                Throws("SetSize(contents, flow)", delegate { s.SetSize(spec.Size, px, false); });
-                Throws("Hide(false)", delegate { s.Hide(false); });
-                Throws("SetMotion(7)", delegate { s.SetMotion(4, 380, 230, 10, 60, 45, 34); });
-                Throws("SetMotion(8)", delegate { s.SetMotion(4, 380, 230, 10, 60, 45, 34, 2); });
-                Throws("SetUpdates", delegate { s.SetUpdates(15, true, false); });
-                Throws("SetPointerArea", delegate { s.SetPointerArea(new Rectangle(0, 0, 10, 10)); });
-                Throws("SetSlosh", delegate { s.SetSlosh(0, 60); });
-                Throws("Kick", delegate { s.Kick(1); });
-                Throws("SetBusy", delegate { s.SetBusy(true); });
-                Throws("SetButtons", delegate { s.SetButtons(new GlassButton[1] { new GlassButton() }, false); });
+                Works("SetSize(contents, flow)", delegate { s.SetSize(spec.Size, px, false); });
+                Works("Hide(false)", delegate { s.Hide(false); });
+                Works("SetMotion(7)", delegate { s.SetMotion(4, 380, 230, 10, 60, 45, 34); });
+                Works("SetMotion(8)", delegate { s.SetMotion(4, 380, 230, 10, 60, 45, 34, 2); });
+                Works("SetUpdates", delegate { s.SetUpdates(15, true, false); });
+                Works("SetPointerArea", delegate { s.SetPointerArea(new Rectangle(0, 0, 10, 10)); });
+                Works("SetSlosh", delegate { s.SetSlosh(0, 60); });
+                Works("Kick", delegate { s.Kick(1); });
+                Works("SetBusy", delegate { s.SetBusy(true); });
+                Works("SetButtons", delegate { s.SetButtons(new GlassButton[1] { new GlassButton() }, false); });
                 Throws("BeforeRender", delegate { s.BeforeRender += delegate(float v) { }; });
                 try { s.Hide(true); s.SetSize(new Size(300, 100)); s.Show(); Note(Api, true, 0, "the old calls still work over the pipe"); }
                 catch (Exception ex) { Note(Api, false, 255, "an old call threw over the pipe: " + ex.Message); }

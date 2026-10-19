@@ -64,7 +64,7 @@ namespace LGBench
             foreach (Kind k in AllKinds) kinds.Add(k.Name);
             List<float> scales = new List<float>(AllScales);
             string wallpaper = @"C:\Windows\Web\Wallpaper\Windows\img0.jpg";
-            bool energy = false, check = false, timing = true, quick = false, zoom = false, elevation = false, service = false, contract = false, loopback = false, host = false, probe = false, motion = false, surface = false, hostmain = false;
+            bool energy = false, check = false, timing = true, quick = false, zoom = false, elevation = false, service = false, contract = false, loopback = false, host = false, probe = false, motion = false, surface = false, hostmain = false; string proofDir = null;
             string ab = "", reportPath = null, sheetPath = null;
             for (int i = 0; i < args.Length; i++)
             {
@@ -95,6 +95,7 @@ namespace LGBench
                     case "-loopback": loopback = true; break;
                     case "-host": host = true; break;
                     case "-surface": surface = true; break;
+                    case "-proof": proofDir = next; i++; break;
                     case "-hostmain": hostmain = true; break;
                     case "-probe": probe = true; break;
                     case "-wallpaper": wallpaper = next; i++; break;
@@ -108,7 +109,7 @@ namespace LGBench
                 scenes = new List<string>(new string[] { "busy", "wall" });
                 scales = new List<float>(new float[] { 2f });
             }
-            if (service || contract || surface || hostmain)
+            if (service || contract || surface || hostmain || proofDir != null)
             {
                 // (the service checks stand alone: not the default timing run, and no scenes unless another mode needs them)
                 timing = false;
@@ -171,6 +172,7 @@ namespace LGBench
             if (service) ServiceBench();
             if (contract) Contract.Run(loopback, host);
             if (surface) SurfaceBench.Run();
+            if (proofDir != null) Proof.Run(proofDir);
             if (hostmain) HostBench.Run();
             if (reportPath != null) File.WriteAllText(reportPath, report.ToString());
             return 0;
@@ -196,6 +198,7 @@ namespace LGBench
             Console.WriteLine("  -loopback             with -contract: the same over a GlassHostServer in this process (real pipe, sections, events)");
             Console.WriteLine("  -host                 with -contract: the same against the INSTALLED LGEngineHost.exe (env LGENGINE_HOST, else beside a running LiquidGlass.exe, else beside this exe), started on demand (then a kill test); skipped if none");
             Console.WriteLine("  -surface              the app's glass through the surface API vs the direct path, pixel for pixel (step 6)");
+            Console.WriteLine("  -proof DIR            picture proof of the C++ app's glass animations (wire to host, frames, PNGs into DIR)");
             Console.WriteLine("  -hostmain             the host process's runner in memory: single instance, idle exit, log ring (phase 2b)");
             Console.WriteLine("  -report FILE       also write the output to a file");
         }
