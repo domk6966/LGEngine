@@ -42,6 +42,8 @@ namespace LGEngine
             if (!shown && alpha > 0)
             {
                 Win.ShowWindow(Handle, Win.SW_SHOWNOACTIVATE);
+                // WS_EX_TOPMOST alone can leave the window under ordinary maximized windows; put it on top of the topmost ones.
+                Win.SetWindowPos(Handle, Win.HWND_TOPMOST, 0, 0, 0, 0, Win.SWP_NOSIZE | Win.SWP_NOMOVE | Win.SWP_NOACTIVATE);
                 shown = true;
             }
         }
@@ -131,6 +133,10 @@ namespace LGEngine
             public const byte AC_SRC_ALPHA = 1;
             public const int SW_HIDE = 0;
             public const int SW_SHOWNOACTIVATE = 4;
+            public static readonly IntPtr HWND_TOPMOST = new IntPtr(-1);
+            public const uint SWP_NOSIZE = 0x0001;
+            public const uint SWP_NOMOVE = 0x0002;
+            public const uint SWP_NOACTIVATE = 0x0010;
 
             [StructLayout(LayoutKind.Sequential)]
             public struct POINT
@@ -167,6 +173,10 @@ namespace LGEngine
             [DllImport("user32.dll")]
             [return: MarshalAs(UnmanagedType.Bool)]
             public static extern bool ShowWindow(IntPtr hwnd, int command);
+
+            [DllImport("user32.dll")]
+            [return: MarshalAs(UnmanagedType.Bool)]
+            public static extern bool SetWindowPos(IntPtr hwnd, IntPtr insertAfter, int x, int y, int cx, int cy, uint flags);
 
             [DllImport("user32.dll")]
             [return: MarshalAs(UnmanagedType.Bool)]
