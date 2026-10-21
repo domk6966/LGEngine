@@ -333,6 +333,7 @@ namespace LGEngine
                 + s.Shadow + "," + s.Intensity + "," + s.Round + (s.Elevation != GlassLook.DefaultElevation ? ",E" + s.Elevation : "") + "/" + shape.Name
                 + (shape.Profile != null ? "/p" + shape.Profile.Hash : "")
                 + (GlassOptions.ViewStep != 1 ? "/v" + GlassOptions.ViewStep : "") + (GlassOptions.FaceStep2 ? "" : "/nf") + (GlassOptions.AnalyticEdge ? "" : "/pt") + (GlassOptions.CubicEdge ? "/ce" : "")
+                + (GlassOptions.EdgeSoft != 1f ? "/es" + GlassOptions.EdgeSoft.ToString(System.Globalization.CultureInfo.InvariantCulture) : "") + (GlassOptions.EdgeAniso ? "/ea" : "")
                 + (GlassOptions.RayTrace ? "/rt" : "");
         }
 
@@ -687,7 +688,10 @@ namespace LGEngine
             // below the card, and the hairline darker edge right along the outline. Under the
             // outermost pixels of the glass too, which it only partly covers: left out there, it
             // shows as a broken, jagged rim wherever the edge runs between pixels.
-            Func<float, float, float, int> Outside = delegate(float px, float py, float sd)
+            float edgeSoft = GlassOptions.EdgeSoft;
+            bool edgeAniso = GlassOptions.EdgeAniso;
+            float hwMax = 0.5f * edgeSoft * (edgeAniso ? 1.4143f : 1f);
+            Func<float, float, float, float, int> Outside = delegate(float px, float py, float sd, float hwL)
             {
                 // (the shadow by the plain rounded outline: too soft for the corners' curve to show)
                 float cx = Math.Abs(px) - (hx - rad), cy = Math.Abs(py - drop) - (hy - rad), s2;
@@ -697,8 +701,8 @@ namespace LGEngine
                 if (analytic)
                 {
                     // the hairline averaged over the pixel's extent outside the outline
-                    float s0 = Math.Max(0f, sd - 0.5f), s1 = Math.Min(outlineW, sd + 0.5f);
-                    edgeLine = s1 > s0 ? ((s1 - s0) - (s1 * s1 - s0 * s0) / (2 * outlineW)) / Math.Max(0.001f, sd + 0.5f - s0) : 0;
+                    float s0 = Math.Max(0f, sd - hwL), s1 = Math.Min(outlineW, sd + hwL);
+                    edgeLine = s1 > s0 ? ((s1 - s0) - (s1 * s1 - s0 * s0) / (2 * outlineW)) / Math.Max(0.001f, sd + hwL - s0) : 0;
                 }
                 else edgeLine = 1 - sd / outlineW;
                 return edgeLine > 0 ? Math.Max(shade, (int)(outline * edgeLine)) : shade;
@@ -733,14 +737,14 @@ namespace LGEngine
                 float top = 1 - (py + hy) / (cardH * 0.75f);
                 rowGlow[y] = top <= 0 ? 0 : (int)(top * top * 8f * intensity + 0.5f);
                 int firstCov = -1, lastCov = -1, faceL = -1, faceR = -1;
-                if (Math.Abs(py) - hy >= 0.5f)
+                if (Math.Abs(py) - hy >= hwMax)
                 {
                     // (a row wholly outside the glass: only the shadow there, the same mirrored left to right)
                     for (int x = 0; x < (W + 1) / 2; x++)
                     {
                         float px = x - Margin - hx + 0.5f;
                         float nx, ny, sd = Outline(px, py, hx, hy, cornerR, corner, out nx, out ny);
-                        int shade = Outside(px, py, sd);
+                        int shade = Outside(px, py, sd, HalfW(nx, ny, edgeSoft, edgeAniso));
                         if (shade > 0) template[y * W + x] = template[y * W + W - 1 - x] = shade << 24;
                     }
                     continue;
@@ -750,9 +754,10 @@ namespace LGEngine
                     float px = x - Margin - hx + 0.5f;
                     float nx, ny, sd = Outline(px, py, hx, hy, cornerR, corner, out nx, out ny);
                     rsd[x] = sd; rnx[x] = nx; rny[x] = ny; rt[x] = 1;
-                    if (sd >= 0.5f)
+                    float hwP = HalfW(nx, ny, edgeSoft, edgeAniso);
+                    if (sd >= hwP)
                     {
-                        int shade = Outside(px, py, sd);
+                        int shade = Outside(px, py, sd, hwP);
                         if (shade > 0) template[y * W + x] = shade << 24;
                         continue;
                     }
@@ -772,9 +777,10 @@ namespace LGEngine
                         float px = x - Margin - hx + 0.5f;
                         float nx, ny, sd = Outline(px, py, hx, hy, cornerR, corner, out nx, out ny);
                         rsd[x] = sd; rnx[x] = nx; rny[x] = ny; rt[x] = 1;
-                        if (sd >= 0.5f)
+                        float hwP = HalfW(nx, ny, edgeSoft, edgeAniso);
+                        if (sd >= hwP)
                         {
-                            int shade = Outside(px, py, sd);
+                            int shade = Outside(px, py, sd, hwP);
                             if (shade > 0) template[y * W + x] = shade << 24;
                             continue;
                         }
@@ -799,8 +805,10 @@ namespace LGEngine
                     float sd = rsd[x], nx = rnx[x], ny = rny[x], t = rt[x];
                     float depth = -sd;
 
-                    float coverage = 0.5f - sd;
-                    int cover = coverage >= 1 ? 255 : coverage <= 0 ? 0 : (int)(coverage * 255), under = coverage >= 1 ? 0 : Outside(px, py, Math.Max(0f, sd));
+                    float hw = HalfW(nx, ny, edgeSoft, edgeAniso);
+                    float taper = Math.Max(0f, Math.Min(1f, (3f - depth) / 2f)), hwL = 0.5f + (hw - 0.5f) * taper;
+                    float coverage = 0.5f - sd / (2f * hw);
+                    int cover = coverage >= 1 ? 255 : coverage <= 0 ? 0 : (int)(coverage * 255), under = coverage >= 1 ? 0 : Outside(px, py, Math.Max(0f, sd), hwL);
                     mixes[count] = cover | (under << 8);
 
                     float facing = nx * l2x + ny * l2y;
@@ -808,7 +816,7 @@ namespace LGEngine
                     {
                         // (ray-traced: the light and how much of the view comes through, averaged over the pixel)
                         int tg, ta;
-                        trace.Light(depth, facing, out tg, out ta);
+                        trace.Light(depth, facing, hwL, out tg, out ta);
                         light[count] = (tg << 16) | ta;
                         facings[count] = Facing(nx, ny);
                         count++;
@@ -822,7 +830,7 @@ namespace LGEngine
                     float inner = 1 - depth / glowDepth;
                     // (the line on the outline has faded to nothing a few of its widths in: no need to
                     // work it out there, which is most of the curve)
-                    float spec = depth < 7 * specFade ? Falloff(depth, specFade, analytic) : 0;
+                    float spec = depth < 7 * specFade ? Falloff(depth, specFade, analytic, hwL) : 0;
                     float white = (spec * SpecMix * shape.SpecGain + (inner > 0 ? GlowMix * shape.GlowGain * (float)Math.Pow(inner, GlowPower) : 0)) * lit * edgeLight;
                     float glintAt;
                     if (GlintPower == 8f)
@@ -832,7 +840,7 @@ namespace LGEngine
                         glintAt = t4 * t4 + GlintAway * a4 * a4;
                     }
                     else glintAt = (float)Math.Pow(toward, GlintPower) + GlintAway * (float)Math.Pow(away, GlintPower);
-                    if (glintAt > 0.01f) white += GlintMix * glintAt * Falloff(depth, glintFade, analytic) * glintLight;
+                    if (glintAt > 0.01f) white += GlintMix * glintAt * Falloff(depth, glintFade, analytic, hwL) * glintLight;
                     if (white > 0.95f) white = 0.95f;
                     float glow = top < 0 ? 0 : top * top * 8f * (1 - Math.Min(1f, Math.Max(0f, t))) * intensity;
                     float gain = 1 - white;
@@ -1175,12 +1183,21 @@ namespace LGEngine
             if (cell >= cells - 1) { cell = Math.Max(0, cells - 2); mix = cells > 1 ? 256 : 0; }
         }
 
+        // Half a pixel's extent across the outline along its normal (nx, ny): 0.5 * soft, and with
+        // aniso the footprint's projection on the normal (0.5 at the poles, 0.707 on diagonals).
+        static float HalfW(float nx, float ny, float soft, bool aniso)
+        {
+            float hw = 0.5f * soft;
+            if (aniso) hw *= Math.Abs(nx) + Math.Abs(ny);
+            return hw;
+        }
+
         // The mean of exp(-d / fade) over a pixel's extent across the edge (depth d at its middle,
         // and only the part of it inside the glass), or just its value at the middle.
-        static float Falloff(float depth, float fade, bool analytic)
+        static float Falloff(float depth, float fade, bool analytic, float hwL)
         {
             if (!analytic) return (float)Math.Exp(-depth / fade);
-            float d0 = Math.Max(0f, depth - 0.5f), d1 = depth + 0.5f;
+            float d0 = Math.Max(0f, depth - hwL), d1 = depth + hwL;
             if (d1 - d0 < 0.01f) return (float)Math.Exp(-depth / fade);
             return fade * (float)(Math.Exp(-d0 / fade) - Math.Exp(-d1 / fade)) / (d1 - d0);
         }

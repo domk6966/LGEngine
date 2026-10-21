@@ -24,6 +24,10 @@ namespace LGEngine
         // (map) The rim's less-frosted picture is enlarged with a cubic B-spline (to one texel a pixel)
         // before the rim samples it, rather than read straight with linear blending.
         public static bool CubicEdge = false;
+        // (map) Anti-aliasing of the glass's outline: the edge ramp is EdgeSoft pixels wide (1 = a box
+        // one pixel wide), and with EdgeAniso it follows the pixel's footprint along the outline's normal.
+        internal static float EdgeSoft = 1.35f;
+        internal static bool EdgeAniso = true;
         // A new picture of the backdrop with only part of it changed: only what that part reaches is
         // drawn again (and reported as dirty). 0 draws the whole glass for every new picture.
         public static bool Incremental = true;

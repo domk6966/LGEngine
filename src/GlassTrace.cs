@@ -235,9 +235,9 @@ namespace LGEngine
 
         // The footprint of a pixel at t (half a pixel each way across the outline), within the glass, and the
         // running sums at its two ends (into fa, fb).
-        void Footprint(float t, out float a, out float b, int from)
+        void Footprint(float t, out float a, out float b, int from, float halfPix)
         {
-            float hw = 0.5f / bezel;
+            float hw = halfPix / bezel;
             a = t - hw;
             b = t + hw;
             if (a < 0) a = 0;
@@ -257,7 +257,7 @@ namespace LGEngine
         public void Land(float t, out float lr, out float lg, out float lb, out float spread)
         {
             float a, b;
-            Footprint(t, out a, out b, 0);
+            Footprint(t, out a, out b, 0, 0.5f);
             double w = fb[0] - fa[0];
             lr = (float)((fb[1] - fa[1]) / w);
             lg = (float)((fb[2] - fa[2]) / w);
@@ -273,10 +273,16 @@ namespace LGEngine
         // on it (linear, rolled off: 0 to 4096).
         public void Light(float depth, float facing, out int gain, out int add)
         {
+            Light(depth, facing, 0.5f, out gain, out add);
+        }
+
+        // (halfPix: half the pixel's extent across the edge, in pixels; 0.5 = one pixel)
+        public void Light(float depth, float facing, float halfPix, out int gain, out int add)
+        {
             float t = 1 - depth / bezel;
-            if (t + 0.5f / bezel <= quietBelow) { gain = 256; add = 0; return; }
+            if (t + halfPix / bezel <= quietBelow) { gain = 256; add = 0; return; }
             float a, b;
-            Footprint(t, out a, out b, 6);
+            Footprint(t, out a, out b, 6, halfPix);
             double span = (b - a) * Steps;
             double piped = (fb[4] - fa[4]) / span - facePipe;
             double keep = ((fb[0] - fa[0]) / span + PipeView * piped) / ((1 - R0) * (1 - R0));
