@@ -521,8 +521,10 @@ namespace LGEngine
             linearLight = traced;
             float reach = traced ? 0 : shape.EdgeReach * bevel * Math.Min(1.5f, refraction * intensity);
 
-            SharpFactor = Math.Max(1, (int)Math.Round(k));
             float sigma = s.Blur * FrostPerUnit * k * shape.FaceFrost;
+            int shrink = Math.Max(1, (int)Math.Round(k));
+            // (a lens face that would only be shrunk, never frosted, is read at one texel a pixel: shrunk, its view and rim look coarse at 150-250%)
+            SharpFactor = shape.Name == "lens" && sigma < shrink * 1.26f ? 1 : shrink;
             Frost(sigma, SharpFactor, out Ratio, out SoftPasses);
             Factor = SharpFactor * Ratio;
             Pad = Math.Max(Factor * 3, (int)Math.Ceiling(reach + 3 * k));   // (the picture read must take in what the rim looks out at)
